@@ -1,0 +1,23 @@
+# M4A Worker — Dependencias
+# Instala con: pip install -r requirements.txt
+
+# HTTP y async
+httpx==0.28.1
+python-dotenv==1.1.1
+requests>=2.32,<3
+
+# Logging
+loguru==0.7.3
+
+# Windows tray UI
+Pillow>=11.3,<12
+pystray>=0.19.5,<0.20
+
+# Transcripción (Whisper)
+faster-whisper==1.2.0
+ctranslate2==4.7.1
+
+# CUDA runtime para Windows (GPU strict)
+nvidia-cublas-cu12==12.9.1.4; platform_system == "Windows"
+nvidia-cudnn-cu12==9.20.0.48; platform_system == "Windows"
+nvidia-cuda-runtime-cu12==12.9.79; platform_system == "Windows"
