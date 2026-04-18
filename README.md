@@ -94,18 +94,34 @@ Nota: el codigo mantiene compatibilidad con `VAD_MIN_SPEECH_DURATION_MS`, pero e
 |---|---:|---|
 | `SUMMARY_PROVIDER` | `gemini` | `gemini`, `groq` o `disabled` |
 | `GEMINI_API_KEY` | vacío | API key para Gemini |
-| `GEMINI_MODEL` | `gemini-2.5-flash` | Modelo Gemini |
+| `GEMINI_MODEL` | `gemini-2.5-flash` | Modelo Gemini primario |
+| `GEMINI_FALLBACK_MODEL` | `gemini-2.5-flash-lite` | Fallback interno de Gemini cuando hay rate limit o error 5xx |
+| `GEMINI_MAX_OUTPUT_TOKENS` | `6144` | Limite de salida para mejorar profundidad sin disparar consumo en exceso |
+| `GEMINI_MAX_ATTEMPTS` | `2` | Intentos cortos por modelo antes de pasar al siguiente |
 | `GROQ_API_KEY` | vacío | API key para Groq |
-| `GROQ_MODEL` | `llama-3.3-70b-versatile` | Modelo Groq |
+| `GROQ_MODEL` | `llama-3.3-70b-versatile` | Modelo Groq primario |
+| `GROQ_FALLBACK_MODEL` | `llama-3.1-8b-instant` | Fallback de Groq con mayor margen de RPM/TPM |
+| `GROQ_MAX_ATTEMPTS` | `2` | Intentos cortos por modelo antes de pasar al siguiente |
+| `OLLAMA_BASE_URL` | `http://127.0.0.1:11434` | URL local de Ollama para el fallback final |
+| `OLLAMA_MODEL` | `qwen2.5:7b` | Modelo local final si Gemini y Groq fallan |
+| `OLLAMA_REQUEST_TIMEOUT` | `600` | Timeout de lectura para respuesta de Ollama |
+| `OLLAMA_CONNECT_TIMEOUT` | `10` | Timeout de conexion a Ollama |
+| `OLLAMA_MAX_ATTEMPTS` | `2` | Reintentos de Ollama antes de darlo por fallido |
+| `OLLAMA_RETRY_DELAY` | `2.5` | Espera entre reintentos de Ollama |
+| `OLLAMA_SAFE_PROMPT_CHARS` | `14000` | Recorte de seguridad de prompt para Ollama |
+| `OLLAMA_NUM_PREDICT` | `2300` | Tokens aproximados de salida para mantener profundidad en fallback local |
 | `GROQ_REQUEST_DELAY` | `2.5` | Delay entre llamadas a Groq en procesamiento por bloques |
+| `GROQ_MAX_TOKENS` | `3072` | Maximo de tokens de salida para mejorar consistencia de detalle |
 | `AI_TEMPERATURE` | `0.1` | Temperatura de generacion |
 | `AI_REQUEST_TIMEOUT` | `120` | Timeout de peticiones a IA |
-| `MAX_TRANSCRIPT_SIZE_SINGLE` | `15000` | Maximo de caracteres antes de dividir en bloques |
+| `MAX_TRANSCRIPT_SIZE_SINGLE` | `60000` | Maximo de caracteres antes de dividir en bloques |
 | `AI_CHUNK_MAX_CHARS` | `12000` | Tamano maximo de bloque para resumen general |
 | `GROQ_CHUNK_MAX_CHARS` | `8000` | Tamano maximo de bloque cuando Groq es proveedor primario |
 | `GROQ_SAFE_PROMPT_CHARS` | `10000` | Limite de seguridad para evitar errores 413 en Groq |
+| `SUMMARY_TARGET_WORDS_MIN` | `2000` | Referencia minima para orientar la longitud proporcional de salida |
+| `SUMMARY_TARGET_WORDS_MAX` | `3000` | Referencia maxima para orientar la longitud proporcional de salida |
 
-Si `SUMMARY_PROVIDER=disabled` o no hay API keys validas, el worker genera un fallback HTML minimo en lugar del resumen enriquecido.
+El worker guarda la transcripcion en storage apenas termina Whisper y despues genera el resumen. Si la IA falla tras guardar la transcripcion, la nota queda en `retry` para reprocesarla manualmente sin perder el texto original.
 
 ## Ejecucion
 
@@ -131,6 +147,14 @@ El icono muestra:
 - El worker escribe logs en `worker.log` dentro de la carpeta del proyecto.
 
 El conteo pendiente usa el dato que entregue el backend si existe en `GET /api/v1/worker/status` o en el payload del job. Si el backend no expone ese conteo, el icono seguira mostrando progreso por job y un conteo local minimo.
+
+## Pruebas
+
+Para ejecutar las pruebas de regresion del resumen:
+
+```powershell
+python -m unittest discover -s tests -p "test_*.py" -v
+```
 
 ## Inicio automatico en Windows
 

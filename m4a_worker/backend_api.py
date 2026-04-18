@@ -96,24 +96,57 @@ async def send_progress(client: httpx.AsyncClient, nota_id: int, percent: int, m
         logger.warning(f"No se pudo enviar progreso: {e}")
 
 
-async def complete_job(
+async def save_transcript(
     client: httpx.AsyncClient,
     nota_id: int,
-    html: str,
-    transcript: str | None,
+    transcript: str,
     duration: float | None,
     language: str | None,
 ):
     resp = await client.post(
-        f"{API_BASE}/worker/jobs/{nota_id}/complete",
+        f"{API_BASE}/worker/jobs/{nota_id}/transcript",
         headers=WORKER_HEADERS,
         json={
-            "html": html,
             "transcript_text": transcript,
-            "duration_seconds": duration,
+            "duration_seconds": int(duration) if duration is not None else None,
             "language": language,
         },
         timeout=30.0,
+    )
+    resp.raise_for_status()
+
+
+async def complete_job(
+    client: httpx.AsyncClient,
+    nota_id: int,
+    html: str,
+    transcript: str | None = None,
+    duration: float | None = None,
+    language: str | None = None,
+):
+    payload = {"html": html}
+    if transcript is not None:
+        payload["transcript_text"] = transcript
+    if duration is not None:
+        payload["duration_seconds"] = duration
+    if language is not None:
+        payload["language"] = language
+
+    resp = await client.post(
+        f"{API_BASE}/worker/jobs/{nota_id}/complete",
+        headers=WORKER_HEADERS,
+        json=payload,
+        timeout=30.0,
+    )
+    resp.raise_for_status()
+
+
+async def mark_retry(client: httpx.AsyncClient, nota_id: int, error: str):
+    resp = await client.post(
+        f"{API_BASE}/worker/jobs/{nota_id}/retry",
+        headers=WORKER_HEADERS,
+        json={"error": error},
+        timeout=20.0,
     )
     resp.raise_for_status()
 

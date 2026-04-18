@@ -7,8 +7,8 @@ from typing import Any
 import httpx
 from loguru import logger
 
-from .ai_summary import clean_html, summarize
-from .backend_api import complete_job, send_progress
+from .ai_summary import AIServiceUnavailable, clean_html, summarize
+from .backend_api import complete_job, mark_retry, save_transcript, send_progress
 from .transcription import transcribe_file_with_progress
 
 
@@ -60,13 +60,27 @@ class JobProcessor:
                     audio_path,
                     progress_callback=progress_callback,
                 )
+                await self._persist_transcript(
+                    client,
+                    data,
+                    transcript,
+                    duration,
+                    language,
+                    progress_callback=progress_callback,
+                )
 
-            html = await self._summarize(client, data, transcript, progress_callback=progress_callback)
+            try:
+                html = await self._summarize(client, data, transcript, progress_callback=progress_callback)
+            except AIServiceUnavailable as exc:
+                await self._mark_retry(client, data, str(exc), progress_callback=progress_callback)
+                logger.warning(f"⚠️ Job nota_id={data.nota_id} quedó en retry manual tras agotar IA")
+                return
+
             await self._complete(
                 client,
                 data,
                 html,
-                None if data.is_reprocess else transcript,
+                None,
                 duration,
                 language,
                 progress_callback=progress_callback,
@@ -85,6 +99,29 @@ class JobProcessor:
         await send_progress(client, nota_id, percent, message)
         if progress_callback is not None:
             await progress_callback(percent, message)
+
+    async def _persist_transcript(
+        self,
+        client: httpx.AsyncClient,
+        data: JobData,
+        transcript: str,
+        duration: float | None,
+        language: str | None,
+        progress_callback: Callable[[int, str], Awaitable[None]] | None = None,
+    ):
+        await self._emit_progress(client, data.nota_id, 55, "Guardando transcripción...", progress_callback)
+        await save_transcript(client, data.nota_id, transcript, duration, language)
+        logger.info(f"Transcripción persistida para nota_id={data.nota_id} ({len(transcript)} chars)")
+
+    async def _mark_retry(
+        self,
+        client: httpx.AsyncClient,
+        data: JobData,
+        error: str,
+        progress_callback: Callable[[int, str], Awaitable[None]] | None = None,
+    ):
+        await self._emit_progress(client, data.nota_id, 100, "IA agotada. Queda listo para reintento manual.", progress_callback)
+        await mark_retry(client, data.nota_id, error)
 
     async def _download_audio(
         self,

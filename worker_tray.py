@@ -10,11 +10,11 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 from pystray import Icon, Menu, MenuItem
 
+from m4a_worker.config import LOG_PATH
 from m4a_worker.runner import run_worker
 from m4a_worker.runtime_state import WorkerRuntimeState
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-LOG_PATH = PROJECT_ROOT / "worker.log"
 
 
 def _load_font(size: int) -> ImageFont.ImageFont:

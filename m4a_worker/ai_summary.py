@@ -1,6 +1,7 @@
-import asyncio
-import random
+﻿import asyncio
+import re
 import time
+import unicodedata
 from enum import Enum
 
 import httpx
@@ -11,549 +12,673 @@ from .config import (
     AI_REQUEST_TIMEOUT,
     AI_TEMPERATURE,
     GEMINI_API_KEY,
+    GEMINI_FALLBACK_MODEL,
+    GEMINI_MAX_ATTEMPTS,
+    GEMINI_MAX_OUTPUT_TOKENS,
     GEMINI_MODEL,
-    GROQ_API_KEY,
-    GROQ_CHUNK_MAX_CHARS,
-    GROQ_MODEL,
-    GROQ_REQUEST_DELAY,
-    GROQ_SAFE_PROMPT_CHARS,
     MAX_TRANSCRIPT_SIZE_SINGLE,
+    OLLAMA_BASE_URL,
+    OLLAMA_CONNECT_TIMEOUT,
+    OLLAMA_ENABLED,
+    OLLAMA_MAX_ATTEMPTS,
+    OLLAMA_MODEL,
+    OLLAMA_NUM_PREDICT,
+    OLLAMA_REQUEST_TIMEOUT,
+    OLLAMA_RETRY_DELAY,
+    OLLAMA_SAFE_PROMPT_CHARS,
     SUMMARY_PROVIDER,
+    SUMMARY_TARGET_WORDS_MAX,
+    SUMMARY_TARGET_WORDS_MIN,
 )
 
 SYSTEM_PROMPT = (
-    "Eres un asistente academico especializado en crear apuntes de clase a partir de "
-    "transcripciones de audio. Tu trabajo es EXTRAER y ORGANIZAR fielmente el contenido "
-    "real de la clase, NO generar contenido generico de libro de texto.\n\n"
-    "REGLA FUNDAMENTAL: Solo incluye temas, conceptos, ejemplos, ejercicios y tareas que "
-    "realmente se mencionaron en la transcripcion. Si el profesor menciono un concepto "
-    "brevemente, puedes agregar una definicion corta entre parentesis para clarificar, "
-    "pero NUNCA inventes secciones enteras con contenido que no se discutio en clase. "
-    "La transcripcion proviene de audio y puede contener errores de reconocimiento de voz; "
-    "interpreta inteligentemente las palabras mal transcritas segun el contexto academico. "
-    "Produce HTML valido y bien estructurado."
+    "Eres un asistente academico hiper-detallista especializado en crear apuntes exhaustivos de clase a partir de "
+    "transcripciones de audio. Tu trabajo es EXTRAER, PRESERVAR y ORGANIZAR fielmente el contenido "
+    "real de la clase. ESTA PROHIBIDO hacer resúmenes genéricos o superficiales.\n\n"
+    "REGLA FUNDAMENTAL: Tienes que mencionar TODOS los ejemplos específicos, anécdotas, casos de estudio, "
+    "herramientas, empresas, y datos técnicos que el profesor haya mencionado en la transcripcion.\n"
+    "Prioriza una profundidad extrema, estructurando paso a paso mediante listas largas y detalladas. "
 )
 
 HTML_FORMAT_RULES = """
 REGLAS DE FORMATO (HTML puro, sin Markdown ni bloques de codigo):
-- Usa <h1> para el titulo principal, <h2> para secciones, <h3> para subsecciones.
-- Escribe parrafos explicativos (<p>) ricos en contenido; evita el abuso de listas.
-- Usa <table> solo para datos comparativos o cronogramas.
-- Usa <strong>, <em> y <code> para resaltar terminos clave.
-- NO incluyas ```html, ```, ni estilos inline (style="...").
+- Usa <h1> para el titulo principal, <h2> para secciones y <h3> para subsecciones por cada bloque discutido.
+- OBLIGATORIO: Usa listas extensas (<ul> y <li>) para desglosar TODO el detalle, explicaciones y ejemplos puntuales. Protege la granularidad de la información.
+- Usa parrafos explicativos (<p>) para introducir conceptos o historias, y luego desglosa los hechos con viñetas.
+- Usa <table> para cronogramas o comparaciones.
+- Usa <strong>, <em> para resaltar terminos clave.
+- NO incluyas ```html, ``` ni estilos inline.
 """.strip()
 
 TASK_DETECTION_RULES = """
-DETECCION DE CARGA ACADEMICA (MUY IMPORTANTE):
-- Busca menciones a talleres, trabajos, ejercicios, tareas, examenes, parciales,
-  quices, entregas, "para la proxima clase", "tienen que hacer", "van a entregar",
-  "quiero que hagan", "me verifican", presentaciones, lecturas asignadas y actividades.
-- Si hay carga academica, crea una seccion <h2>📝 Carga Academica y Fechas Importantes</h2>
-  con tabla: Actividad | Fecha/Plazo | Descripcion detallada / Instrucciones del profesor.
-- Si no hay menciones, escribe:
+SECCION DE TAREAS Y ACCIONES (MUY IMPORTANTE):
+- Busca minuciosamente menciones a talleres, trabajos, ejercicios, tareas, examenes, parciales, quices, entregas, "para la proxima clase", lecturas, proyectos o "pitch".
+- Si hay menciones a evaluaciones, proyectos o sustentaciones, plásmalo con alto detalle en <h2>📝 Carga Academica y Fechas Importantes</h2>.
+- Si genuinamente no hay menciones, escribe:
   <p><strong>No se mencionaron tareas, examenes ni fechas de entrega en esta clase.</strong></p>
+""".strip()
+
+EXPANDED_NOTES_RULES = """
+ESTILO DE APUNTES EXPANDIDOS (NO resumen corto):
+- Actua como transcriptor y editor academico: recupera la mayor cantidad posible de la clase.
+- Exploralos a fondo: desarrolla el contexto, argumentos, TODOS los ejemplos concretos (nombres de empresas, tecnologías, situaciones históricas) y casos de estudio.
+- Enumera fuertemente con <ul> y <li> para desgranar características o componentes, garantizando fidelidad absoluta.
 """.strip()
 
 
 class AIProvider(Enum):
-    GROQ = "groq"
     GEMINI = "gemini"
+    OLLAMA = "ollama"
     DISABLED = "disabled"
 
 
-PROVIDER_RATE_LIMIT_UNTIL: dict[AIProvider, float] = {}
-RATE_LIMIT_WAIT_THRESHOLD = 120.0
+PROVIDER_RATE_LIMIT_UNTIL: dict[str, float] = {}
 
 
-def _build_single_phase_prompt(transcript: str, materia: str = "") -> str:
-    materia_ctx = f"\nMATERIA: {materia}\nContextualiza el contenido dentro de esta asignatura.\n" if materia else ""
-    return f"""Crea notas de estudio detalladas a partir de la siguiente transcripcion de clase.
+class AIServiceUnavailable(RuntimeError):
+    """Indica que no se pudo completar la generacion con ningun proveedor."""
 
-REGLA PRINCIPAL - FIDELIDAD AL CONTENIDO REAL:
-- SOLO incluye temas, conceptos, ejemplos y ejercicios que aparezcan en la transcripcion.
-- NO generes parrafos genericos de libro de texto sobre el tema general.
-- Captura detalles especificos: algoritmos, herramientas, software, formulas,
-  recursos (URLs, notebooks), ejemplos concretos que uso el profesor.
-- La transcripcion puede tener errores de reconocimiento de voz; interpreta segun contexto.
-{materia_ctx}
-ESTRUCTURA (HTML puro):
-<h1>📚 [Titulo especifico basado en temas reales de la clase]</h1>
+
+def _word_count(text: str) -> int:
+    return len(text.split()) if text else 0
+
+
+def _target_word_range(transcript: str) -> tuple[int, int]:
+    transcript_words = _word_count(transcript)
+    if transcript_words <= 0:
+        return 500, 900
+
+    # Calibra por bandas para evitar exigir de mas en entradas medianas,
+    # manteniendo objetivos altos en transcripciones largas.
+    if transcript_words <= 500:
+        proportional_min = int(transcript_words * 0.50)
+        proportional_max = int(transcript_words * 0.95)
+    elif transcript_words <= 1800:
+        proportional_min = int(transcript_words * 0.45)
+        proportional_max = int(transcript_words * 0.82)
+    else:
+        proportional_min = int(transcript_words * 0.52)
+        proportional_max = int(transcript_words * 0.86)
+
+    max_words = min(5000, max(SUMMARY_TARGET_WORDS_MAX, proportional_max))
+    min_words = max(500, min(max_words - 250, max(SUMMARY_TARGET_WORDS_MIN, proportional_min)))
+    return min_words, max_words
+
+
+def _build_summary_prompt(transcript: str, materia: str = "") -> str:
+    min_words, max_words = _target_word_range(transcript)
+    materia_ctx = (
+        f"\nCONTEXTO OPCIONAL DE MATERIA: {materia}\n"
+        if materia.strip()
+        else ""
+    )
+    return f"""Transforma la transcripcion en apuntes de clase extensos y de alta fidelidad.
+
+OBJETIVO:
+- Entregar una transcripción convertida en apuntes exhaustivos, detallando CADA subtema y anécdota.
+- Mantener fidelidad extrema: incluye los mismos ejemplos numéricos o de la vida real (nombres, empresas, herramientas) de la clase original.
+- Nunca reduzcas una explicación larga a un solo párrafo.
+- Prioriza respuestas muy largas y ultra-detalladas.
+
+LONGITUD OBJETIVO:
+- Minimo recomendado: {min_words} palabras.
+- Maximo recomendado: {max_words} palabras.
+- Si hace falta para cubrir bien el contenido, puedes superar el maximo recomendado.
+
+ESTRUCTURA REQUERIDA (HTML puro):
+<h1>📚 [Titulo de la clase o tema principal]</h1>
 <h2>🚀 Resumen Ejecutivo</h2>
-<p>[2-3 parrafos sobre lo cubierto, actividades y expectativas para el estudiante.]</p>
+<p>[2-3 parrafos sobre lo cubierto, el enfoque de la clase y expectativas para el estudiante.]</p>
 <h2>📖 Desarrollo Tematico</h2>
-[Subcapitulos h3 por cada tema real discutido. Sin inventar contenido.]
+[Crea un Subcapitulo <h3> distinto por cada bloque y sub-tema. MENCIONA los ejemplos específicos. ]
+[Usa OBLIGATORIAMENTE múltiples listas y viñetas detalladas <ul> <li> largas para capturar la esencia completa.]
+[NO omitas anécdotas, analogías históricas ni empresas mencionadas.]
 <h2>🛠 Herramientas y Recursos</h2>
 [Solo si se mencionaron recursos.]
-[Seccion de carga academica - ver instrucciones abajo.]
+<h2>📝 Carga Academica y Fechas Importantes</h2>
+[Instrucciones y plazos detallados a los que el estudiante debe prestar atencion.]
 <h2>🧠 Preguntas de Repaso</h2>
-[5 preguntas basadas en el contenido real de esta clase.]
+[Generar al menos 5 preguntas de formato detallado derivadas de lo visto, para poner a prueba el conocimiento.]
+
+REGLAS DE CALIDAD:
+- Desarrolla ideas en parrafos completos y conectados.
+- Incluye ejemplos, decisiones, argumentos y matices presentes en la transcripcion.
+- En "Carga Academica y Fechas Importantes" incluye tareas, plazos y actividades; si no existen, indicarlo explicitamente.
+- Evita frases meta sobre tus limitaciones como modelo.
 
 {HTML_FORMAT_RULES}
-
 {TASK_DETECTION_RULES}
-
+{EXPANDED_NOTES_RULES}
+{materia_ctx}
 TRANSCRIPCION:
-{transcript}"""
+{transcript}
+"""
 
 
 def _build_chunk_prompt(chunk: str, section_num: int, total_sections: int, materia: str = "") -> str:
-    materia_ctx = f"\nMATERIA: {materia}\n" if materia else ""
-    return f"""Extrae notas de estudio detalladas y fieles de esta seccion de una transcripcion de clase.
-{materia_ctx}
-INSTRUCCIONES CRITICAS:
-1. Solo incluye lo discutido realmente en este fragmento.
-2. Preserva detalles especificos (algoritmos, herramientas, ejemplos, ejercicios y recursos).
-3. Elimina muletillas y repeticiones, conservando contenido relevante.
-4. Si hay tareas/fechas/entregas, extraelas con instrucciones completas del profesor.
+    materia_ctx = f"\nCONTEXTO OPCIONAL DE MATERIA: {materia}\n" if materia.strip() else ""
+    return f"""Analiza este fragmento de una transcripcion y extrae apuntes parciales de alta calidad.
+
+OBJETIVO:
+- Sintetiza con profundidad, en formato HTML.
+- Conserva hechos, ejemplos y explicaciones presentes en el texto.
+- No inventes contenido.
+
+FORMATO:
+- Empieza con <h3>[Tema detectado]</h3> en cada idea fuerte.
+- Empuja la descripcion de contextos, matices y ejemplos con varias sub-viñetas <ul> y <li>.
+- Usa varios <p> amplios solamente para conectar viñetas.
+- Identifica desde ya insumos para la obligatoria seccion final <h2>📝 Carga Academica y Fechas Importantes</h2>.
 
 {HTML_FORMAT_RULES}
-
-SECCION {section_num}/{total_sections}:
-{chunk}"""
-
-
-def _build_unification_prompt(combined_summaries: str, materia: str = "") -> str:
-    materia_ctx = f"\nMATERIA: {materia}\nContextualiza las notas dentro de esta asignatura.\n" if materia else ""
-    return f"""Unifica los siguientes borradores de secciones de una clase en un documento HTML cohesivo.
-{materia_ctx}
-INSTRUCCIONES:
-1. El documento final debe reflejar solo lo discutido en clase.
-2. Fusiona redundancias y deja narrativa fluida.
-3. Preserva nombres, recursos, ejercicios e instrucciones del profesor.
-
-ESTRUCTURA REQUERIDA:
-<h1>📚 [Titulo especifico basado en los temas reales de la clase]</h1>
-<h2>🚀 Resumen Ejecutivo</h2>
-<h2>📖 Desarrollo Tematico</h2>
-<h2>🛠 Herramientas y Recursos</h2>
-[Seccion de carga academica - ver instrucciones abajo.]
-<h2>🧠 Preguntas de Repaso</h2>
-
-{HTML_FORMAT_RULES}
-
 {TASK_DETECTION_RULES}
-
-BORRADORES A UNIFICAR:
-{combined_summaries}"""
-
-
-def _get_provider_model(provider: AIProvider) -> str:
-    if provider == AIProvider.GROQ:
-        return GROQ_MODEL
-    if provider == AIProvider.GEMINI:
-        return GEMINI_MODEL
-    return ""
+{EXPANDED_NOTES_RULES}
+{materia_ctx}
+FRAGMENTO {section_num}/{total_sections}:
+{chunk}
+"""
 
 
-def _get_provider_api_key(provider: AIProvider) -> str:
-    if provider == AIProvider.GROQ:
-        return GROQ_API_KEY
-    if provider == AIProvider.GEMINI:
-        return GEMINI_API_KEY
-    return ""
+def _build_unification_prompt(combined_summaries: str, transcript: str, materia: str = "") -> str:
+    materia_ctx = f"\nCONTEXTO OPCIONAL DE MATERIA: {materia}\n" if materia.strip() else ""
+    return f"""Eres un Redactor Academico Maestro ("El Director"). Recibes borradores detallados, fragmentados a partir de una clase inmensa.
+Tu trabajo es UNIFICAR estos apuntes aislados en un solo documento maestro, cohesivo, inmaculado y ultra-detallado, con formato HTML puro.
+
+OBJETIVO:
+- Reconstruir la clase entera con fluidez perfecta.
+- MANTENER Y FUNDIR TODO EL NIVEL DE DETALLE de los borradores en la seccion "Desarrollo Tematico". No omitas contenido valioso o ejemplos.
+- Extrapolar y generar las secciones obligatorias correctamente (Resumen Ejecutivo, Herramientas, Tareas, Preguntas).
+- El documento final NO debe parecer un compilado. Debe lucir como una obra maestra escrita de un solo tiron.
+
+ESTRUCTURA REQUERIDA (HTML puro):
+<h1>📚 [Titulo General que englobe toda la clase]</h1>
+
+<h2>🚀 Resumen Ejecutivo</h2>
+<p>[Sintesis general estructurada de todo el arco de conocimiento abarcado]</p>
+
+<h2>📖 Desarrollo Tematico</h2>
+[Agrupa o enlaza los temas dispersos en los borradores empleando inteligentemente etiquetas <h3>. Desarrolla las ideas profundamente con viñetas largas <ul><li>, conservando anécdotas, nombres, y citas dadas en los borradores.]
+
+<h2>🛠️ Herramientas y Recursos</h2>
+[Extrae todas las plataformas o recursos de los borradores en una lista.]
+
+<h2>📅 Carga Academica y Fechas Importantes</h2>
+[Consolida TODAS las actividades, lecturas o tareas. Si ninguna de las partes aporta algo, pon <p><strong>No se mencionaron tareas, examenes ni fechas de entrega en toda la clase.</strong></p>]
+
+<h2>🧠 Preguntas de Repaso</h2>
+[Construye 5-8 preguntas estrategicas cruzando lo más vital enseñado.]
+
+REGLAS DE CALIDAD:
+- JAMAS metas comentarios meta como "En el borrador 3 se indico..." Escribe directamente la idea.
+- Desarrolla las ideas, evita escribir un solo parrafo largo por tema, dividelo logicamente.
+
+{HTML_FORMAT_RULES}
+{TASK_DETECTION_RULES}
+{EXPANDED_NOTES_RULES}
+{materia_ctx}
+---
+BORRADORES PARCIALES A UNIFICAR:
+{combined_summaries}
+"""
+
+
+def _build_gemini_continuation_prompt(previous_text: str) -> str:
+    return (
+        "Continua exactamente desde donde termino tu respuesta anterior.\n"
+        "No reinicies secciones ni repitas texto.\n"
+        "Mantiene el mismo formato HTML y completa el contenido faltante.\n\n"
+        "RESPUESTA PREVIA:\n"
+        f"{previous_text}"
+    )
+
+
+def _split_transcript(transcript: str, max_chars: int) -> list[str]:
+    words = transcript.split()
+    chunks: list[str] = []
+    current: list[str] = []
+    length = 0
+
+    for word in words:
+        token_len = len(word) + 1
+        if length + token_len > max_chars and current:
+            chunks.append(" ".join(current))
+            current = [word]
+            length = token_len
+        else:
+            current.append(word)
+            length += token_len
+
+    if current:
+        chunks.append(" ".join(current))
+
+    return chunks
+
+
+def _parse_retry_after(value: str) -> float:
+    try:
+        return float(value) + 1.0
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _is_rate_limited(provider: AIProvider) -> bool:
-    until = PROVIDER_RATE_LIMIT_UNTIL.get(provider)
+    until = PROVIDER_RATE_LIMIT_UNTIL.get(provider.value)
     if not until:
         return False
     if time.time() < until:
         return True
-    PROVIDER_RATE_LIMIT_UNTIL.pop(provider, None)
+    PROVIDER_RATE_LIMIT_UNTIL.pop(provider.value, None)
     return False
+
+
+def _remember_rate_limit(provider: AIProvider, wait_seconds: float) -> None:
+    PROVIDER_RATE_LIMIT_UNTIL[provider.value] = time.time() + max(wait_seconds, 0.0)
 
 
 def _detect_primary_provider() -> AIProvider:
     if SUMMARY_PROVIDER == "disabled":
         return AIProvider.DISABLED
-    if SUMMARY_PROVIDER == "groq" and GROQ_API_KEY:
-        return AIProvider.GROQ
     if SUMMARY_PROVIDER == "gemini" and GEMINI_API_KEY:
         return AIProvider.GEMINI
     if GEMINI_API_KEY:
         return AIProvider.GEMINI
-    if GROQ_API_KEY:
-        return AIProvider.GROQ
     return AIProvider.DISABLED
 
 
-def _build_fallback_list(primary: AIProvider) -> list[AIProvider]:
-    fallbacks: list[AIProvider] = []
-    for provider in [AIProvider.GEMINI, AIProvider.GROQ]:
-        if provider == primary:
-            continue
-        if _get_provider_api_key(provider):
-            fallbacks.append(provider)
-    return fallbacks
+def _build_provider_order(primary: AIProvider) -> list[AIProvider]:
+    order: list[AIProvider] = []
+
+    def _add_if_available(provider: AIProvider) -> None:
+        if provider in order:
+            return
+        if provider == AIProvider.GEMINI and not GEMINI_API_KEY:
+            return
+        if provider == AIProvider.OLLAMA and not OLLAMA_ENABLED:
+            return
+        if provider != AIProvider.DISABLED:
+            order.append(provider)
+
+    _add_if_available(primary)
+    _add_if_available(AIProvider.GEMINI)
+    _add_if_available(AIProvider.OLLAMA)
+    return order
 
 
-def _select_available_provider(primary: AIProvider, fallbacks: list[AIProvider]) -> AIProvider | None:
-    if primary != AIProvider.DISABLED and not _is_rate_limited(primary):
-        return primary
-    for provider in fallbacks:
-        if not _is_rate_limited(provider):
-            return provider
-    return None
+def _estimate_tokens(text: str) -> int:
+    return max(1, len(text) // 4)
 
 
-async def _handle_rate_limit(
-    provider: AIProvider,
-    response: httpx.Response,
-    attempt: int,
-    max_retries: int,
-    prompt: str,
-    primary: AIProvider,
-    fallbacks: list[AIProvider],
-) -> str | None:
-    retry_after = response.headers.get("retry-after", "")
-    try:
-        wait_seconds = float(retry_after) + 1.0
-    except ValueError:
-        wait_seconds = (5 * (2 ** attempt)) + random.uniform(1, 3)
-
-    PROVIDER_RATE_LIMIT_UNTIL[provider] = time.time() + wait_seconds
-    logger.warning(
-        f"Rate limit [{provider.value}] | espera={wait_seconds:.0f}s | intento {attempt + 1}/{max_retries}"
-    )
-
-    if wait_seconds <= RATE_LIMIT_WAIT_THRESHOLD:
-        await asyncio.sleep(wait_seconds)
-        return None
-
-    alt = _select_available_provider(primary, fallbacks)
-    if alt and alt != provider:
-        logger.info(f"Cambiando a {alt.value} por espera larga en {provider.value}")
-        return await _call_provider(
-            alt,
-            prompt,
-            max_retries=max(1, max_retries - attempt),
-            primary=primary,
-            fallbacks=fallbacks,
-        )
-
-    await asyncio.sleep(RATE_LIMIT_WAIT_THRESHOLD)
-    return None
+    if "8b" in lower:
+        return 5500
+    return 7000
 
 
-async def _call_groq(prompt: str, max_retries: int, primary: AIProvider, fallbacks: list[AIProvider]) -> str | None:
-    api_key = GROQ_API_KEY
-    if not api_key:
-        return None
+def _model_candidates(provider: AIProvider) -> list[str]:
+    if provider == AIProvider.GEMINI:
+        candidates = [GEMINI_MODEL, GEMINI_FALLBACK_MODEL]
 
-    if len(prompt) > GROQ_SAFE_PROMPT_CHARS:
-        logger.warning(
-            f"Prompt demasiado grande para Groq ({len(prompt):,} chars). "
-            f"Saltando Groq para evitar 413."
-        )
-        return None
-
-    url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": GROQ_MODEL,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": AI_TEMPERATURE,
-        "max_tokens": 16384,
-    }
-
-    for attempt in range(max_retries):
-        try:
-            async with httpx.AsyncClient(timeout=AI_REQUEST_TIMEOUT) as http_client:
-                resp = await http_client.post(url, json=payload, headers=headers)
-            if resp.status_code == 429:
-                handled = await _handle_rate_limit(
-                    AIProvider.GROQ, resp, attempt, max_retries, prompt, primary, fallbacks
-                )
-                if handled:
-                    return handled
-                continue
-            resp.raise_for_status()
-            data = resp.json()
-            if data.get("choices"):
-                return data["choices"][0]["message"]["content"].strip()
-            return None
-        except httpx.HTTPStatusError as e:
-            logger.error(f"HTTP {e.response.status_code} [groq]: {e.response.text[:200]}")
-            if e.response.status_code == 413 or (400 <= e.response.status_code < 500):
-                return None
-        except httpx.TimeoutException:
-            logger.warning(f"Timeout [groq] intento {attempt + 1}/{max_retries}")
-            await asyncio.sleep(2)
-        except Exception as e:
-            logger.error(f"Error [groq]: {type(e).__name__}: {e}")
-            await asyncio.sleep(2)
-
-    return None
+    elif provider == AIProvider.OLLAMA:
+        candidates = [OLLAMA_MODEL]
+    else:
+        candidates = []
+    return [model for model in dict.fromkeys(candidates) if model]
 
 
-async def _call_gemini(prompt: str, max_retries: int) -> str | None:
+
+async def _call_gemini(prompt: str, override_model: str = None) -> str | None:
     if not GEMINI_API_KEY:
         return None
 
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-    )
-    payload = {
-        "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature": AI_TEMPERATURE,
-            "maxOutputTokens": 32768,
-        },
-    }
-
-    for attempt in range(max_retries):
-        try:
-            async with httpx.AsyncClient(timeout=AI_REQUEST_TIMEOUT) as http_client:
-                resp = await http_client.post(url, json=payload, headers={"Content-Type": "application/json"})
-
-            if resp.status_code == 429:
-                retry_after = float(resp.headers.get("retry-after", "60"))
-                delay = min(retry_after + 1.0, 60.0)
-                PROVIDER_RATE_LIMIT_UNTIL[AIProvider.GEMINI] = time.time() + delay
-                logger.warning(f"Rate limit [gemini] - esperando {delay:.0f}s")
-                await asyncio.sleep(delay)
-                continue
-
-            if resp.status_code == 404:
-                logger.error(f"Gemini: modelo '{GEMINI_MODEL}' no encontrado (404)")
-                return None
-
-            resp.raise_for_status()
-            data = resp.json()
-            candidates = data.get("candidates", [])
-            if candidates:
-                parts = candidates[0].get("content", {}).get("parts", [])
-                if parts:
-                    text = parts[0].get("text", "")
-                    if text:
-                        return text.strip()
-            return None
-        except httpx.HTTPStatusError as e:
-            logger.error(f"HTTP {e.response.status_code} [gemini]: {e.response.text[:200]}")
-            if 400 <= e.response.status_code < 500:
-                return None
-        except Exception as e:
-            logger.error(f"Error [gemini]: {type(e).__name__}: {e}")
-            await asyncio.sleep(2)
-
-    return None
-
-
-async def _call_provider(
-    provider: AIProvider,
-    prompt: str,
-    max_retries: int,
-    primary: AIProvider,
-    fallbacks: list[AIProvider],
-) -> str | None:
-    if provider == AIProvider.GROQ:
-        return await _call_groq(prompt, max_retries=max_retries, primary=primary, fallbacks=fallbacks)
-    if provider == AIProvider.GEMINI:
-        return await _call_gemini(prompt, max_retries=max_retries)
-    return None
-
-
-def _split_transcript(transcript: str, max_chars: int = 12000) -> list[str]:
-    words = transcript.split()
-    chunks: list[str] = []
-    current: list[str] = []
-    length = 0
-    for word in words:
-        wlen = len(word) + 1
-        if length + wlen > max_chars and current:
-            chunks.append(" ".join(current))
-            current = [word]
-            length = wlen
-        else:
-            current.append(word)
-            length += wlen
-    if current:
-        chunks.append(" ".join(current))
-    return chunks
-
-
-async def _unify_partials_resilient(partials: list[str], materia: str) -> str | None:
-    current = [p for p in partials if p and "[Seccion no procesada]" not in p]
-    if not current:
-        return None
-
-    combined = "\n\n".join(f"<!-- Seccion {i + 1} -->\n{s}" for i, s in enumerate(current))
-    direct_prompt = _build_unification_prompt(combined, materia=materia)
-    direct = await _call_ai(direct_prompt)
-    if direct:
-        return clean_html(direct)
-
-    round_num = 1
-    while len(current) > 1 and round_num <= 4:
-        next_level: list[str] = []
-        batch_size = 3
-        logger.warning(
-            f"Unificacion directa fallo. Intentando unificacion jerarquica "
-            f"(ronda {round_num}, documentos={len(current)})."
+    candidates = [override_model] if override_model else _model_candidates(AIProvider.GEMINI)
+    for model in candidates:
+        url = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{model}:generateContent?key={GEMINI_API_KEY}"
         )
 
-        for i in range(0, len(current), batch_size):
-            group = current[i : i + batch_size]
-            group_combined = "\n\n".join(f"<!-- Bloque {i + j + 1} -->\n{doc}" for j, doc in enumerate(group))
-            group_prompt = _build_unification_prompt(group_combined, materia=materia)
-            group_summary = await _call_ai(group_prompt)
-            if group_summary:
-                next_level.append(clean_html(group_summary))
-            else:
-                next_level.append("\n\n".join(group))
+        payload = {
+            "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": AI_TEMPERATURE,
+                "maxOutputTokens": GEMINI_MAX_OUTPUT_TOKENS,
+            },
+        }
 
-            await asyncio.sleep(min(GROQ_REQUEST_DELAY, 2.0))
+        for attempt in range(max(1, GEMINI_MAX_ATTEMPTS)):
+            try:
+                async with httpx.AsyncClient(timeout=AI_REQUEST_TIMEOUT) as http_client:
+                    resp = await http_client.post(url, json=payload, headers={"Content-Type": "application/json"})
 
-        current = next_level
-        round_num += 1
+                if resp.status_code == 429:
+                    wait_seconds = _parse_retry_after(resp.headers.get("retry-after", ""))
+                    if wait_seconds > 0:
+                        _remember_rate_limit(AIProvider.GEMINI, wait_seconds)
+                    logger.warning(f"Rate limit [gemini] modelo={model}; intento fallback")
+                    break
 
-    return clean_html(current[0]) if len(current) == 1 else None
+                if resp.status_code in {404, 500, 502, 503, 504}:
+                    logger.warning(f"Gemini devolvio {resp.status_code} en modelo={model}; probando siguiente")
+                    break
 
+                resp.raise_for_status()
+                data = resp.json()
+                candidates_resp = data.get("candidates", [])
+                if not candidates_resp:
+                    return None
 
-async def _call_ai(prompt: str, max_retries: int = 5) -> str | None:
-    primary = _detect_primary_provider()
-    if primary == AIProvider.DISABLED:
-        logger.error("No hay API keys configuradas para proveedores de IA")
-        return None
+                selected = candidates_resp[0]
+                parts = selected.get("content", {}).get("parts", [])
+                text = "\n".join(part.get("text", "") for part in parts if part.get("text")).strip()
+                finish_reason = (selected.get("finishReason") or "").upper()
 
-    fallbacks = _build_fallback_list(primary)
-    provider = _select_available_provider(primary, fallbacks)
+                if text and finish_reason in {"MAX_TOKENS", "LENGTH"}:
+                    continuation_prompt = _build_gemini_continuation_prompt(text)
+                    continuation_payload = {
+                        "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+                        "contents": [{"parts": [{"text": continuation_prompt}]}],
+                        "generationConfig": {
+                            "temperature": AI_TEMPERATURE,
+                            "maxOutputTokens": GEMINI_MAX_OUTPUT_TOKENS,
+                        },
+                    }
+                    async with httpx.AsyncClient(timeout=AI_REQUEST_TIMEOUT) as cont_client:
+                        cont_resp = await cont_client.post(
+                            url,
+                            json=continuation_payload,
+                            headers={"Content-Type": "application/json"},
+                        )
+                    if cont_resp.status_code < 400:
+                        cont_data = cont_resp.json()
+                        cont_candidates = cont_data.get("candidates", [])
+                        if cont_candidates:
+                            cont_parts = cont_candidates[0].get("content", {}).get("parts", [])
+                            cont_text = "\n".join(
+                                part.get("text", "") for part in cont_parts if part.get("text")
+                            ).strip()
+                            if cont_text:
+                                text = f"{text}\n{cont_text}".strip()
 
-    if not provider and PROVIDER_RATE_LIMIT_UNTIL:
-        min_wait = min(PROVIDER_RATE_LIMIT_UNTIL.values()) - time.time()
-        if min_wait > 0:
-            logger.info(f"Todos los proveedores en rate-limit. Esperando {min_wait:.0f}s...")
-            await asyncio.sleep(min_wait + 1)
-            provider = _select_available_provider(primary, fallbacks)
-
-    if not provider:
-        logger.error("No hay proveedores de IA disponibles")
-        return None
-
-    result = await _call_provider(provider, prompt, max_retries=max_retries, primary=primary, fallbacks=fallbacks)
-    if result:
-        return result
-
-    for alt in fallbacks:
-        if alt == provider:
-            continue
-        result = await _call_provider(alt, prompt, max_retries=max_retries, primary=primary, fallbacks=fallbacks)
-        if result:
-            return result
+                if text:
+                    return text
+                return None
+            except httpx.TimeoutException:
+                logger.warning(
+                    f"Timeout [gemini] modelo={model} intento {attempt + 1}/{max(1, GEMINI_MAX_ATTEMPTS)}"
+                )
+                continue
+            except httpx.HTTPStatusError as exc:
+                logger.error(f"HTTP {exc.response.status_code} [gemini]: {exc.response.text[:200]}")
+                if 400 <= exc.response.status_code < 500:
+                    return None
+                break
+            except Exception as exc:
+                logger.error(f"Error [gemini] modelo={model}: {type(exc).__name__}: {exc}")
+                break
 
     return None
 
+async def _call_ollama(prompt: str) -> str | None:
+    base_url = OLLAMA_BASE_URL.rstrip("/")
+    prompt_text = prompt
+    if len(prompt_text) > OLLAMA_SAFE_PROMPT_CHARS:
+        logger.warning(
+            f"Prompt grande para Ollama ({len(prompt_text):,} chars). "
+            f"Recortando a {OLLAMA_SAFE_PROMPT_CHARS:,} chars."
+        )
+        prompt_text = prompt_text[:OLLAMA_SAFE_PROMPT_CHARS]
 
-async def _generate_two_phase_summary(
-    transcript: str,
-    materia: str,
-    progress_callback=None,
-) -> str:
+    timeout = httpx.Timeout(
+        connect=OLLAMA_CONNECT_TIMEOUT,
+        read=OLLAMA_REQUEST_TIMEOUT,
+        write=max(30.0, OLLAMA_CONNECT_TIMEOUT),
+        pool=OLLAMA_CONNECT_TIMEOUT,
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as http_client:
+            tags_resp = await http_client.get(f"{base_url}/api/tags")
+            tags_resp.raise_for_status()
+            tags_data = tags_resp.json() if tags_resp.content else {}
+            models = tags_data.get("models", []) if isinstance(tags_data, dict) else []
+            available = [m.get("name", "") for m in models if isinstance(m, dict) and m.get("name")]
+
+            model = OLLAMA_MODEL
+            if available and model not in available:
+                logger.warning(f"Ollama: modelo '{model}' no disponible. Usando '{available[0]}'")
+                model = available[0]
+
+            for attempt in range(max(1, OLLAMA_MAX_ATTEMPTS)):
+                payload = {
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": prompt_text},
+                    ],
+                    "stream": False,
+                    "options": {
+                        "temperature": AI_TEMPERATURE,
+                        "num_predict": OLLAMA_NUM_PREDICT,
+                    },
+                }
+
+                try:
+                    resp = await http_client.post(f"{base_url}/api/chat", json=payload)
+                    resp.raise_for_status()
+                    data = resp.json() if resp.content else {}
+                    content = (data.get("message", {}).get("content") or "").strip()
+                    if content:
+                        return content
+                except httpx.TimeoutException:
+                    logger.warning(
+                        f"Timeout [ollama] intento {attempt + 1}/{max(1, OLLAMA_MAX_ATTEMPTS)}"
+                    )
+                    if attempt + 1 < max(1, OLLAMA_MAX_ATTEMPTS):
+                        await asyncio.sleep(OLLAMA_RETRY_DELAY)
+                        continue
+                    return None
+                except httpx.HTTPStatusError as exc:
+                    logger.error(f"HTTP {exc.response.status_code} [ollama]: {exc.response.text[:200]}")
+                    if 400 <= exc.response.status_code < 500:
+                        return None
+                    if attempt + 1 < max(1, OLLAMA_MAX_ATTEMPTS):
+                        await asyncio.sleep(OLLAMA_RETRY_DELAY)
+                        continue
+                    return None
+                except Exception as exc:
+                    logger.error(f"Error [ollama] intento {attempt + 1}: {type(exc).__name__}: {exc}")
+                    if attempt + 1 < max(1, OLLAMA_MAX_ATTEMPTS):
+                        await asyncio.sleep(OLLAMA_RETRY_DELAY)
+                        continue
+                    return None
+    except Exception as exc:
+        logger.error(f"Error fatal [ollama]: {type(exc).__name__}: {exc}")
+        return None
+
+
+
+async def _call_provider(provider: AIProvider, prompt: str, override_model: str = None) -> str | None:
+    if provider == AIProvider.GEMINI:
+        return await _call_gemini(prompt, override_model)
+
+    if provider == AIProvider.OLLAMA:
+        return await _call_ollama(prompt)
+    return None
+
+
+async def _call_ai(prompt: str, override_model: str = None) -> str:
     primary = _detect_primary_provider()
-    chunk_chars = AI_CHUNK_MAX_CHARS
-    if primary == AIProvider.GROQ:
-        chunk_chars = min(chunk_chars, GROQ_CHUNK_MAX_CHARS)
+    if primary == AIProvider.DISABLED:
+        raise AIServiceUnavailable("No hay proveedores de IA configurados")
+
+    for provider in _build_provider_order(primary):
+        if _is_rate_limited(provider):
+            continue
+
+        result = await _call_provider(provider, prompt, override_model)
+        if result:
+            logger.info(f"Respuesta IA generada con proveedor={provider.value}")
+            return result
+
+    raise AIServiceUnavailable("Ningun proveedor pudo generar la respuesta")
+
+
+async def _summarize_chunks(transcript: str, materia: str, progress_callback=None) -> str:
+    primary = _detect_primary_provider()
+    # Usamos 60k en modo "Obrero" (Map) para dividir la enorme clase a Gemini 3.1 Flash Lite 
+    chunk_chars = 60000 if primary == AIProvider.GEMINI else AI_CHUNK_MAX_CHARS
+    inter_chunk_delay = 0.1
+
+
+    # Si es muy corto, no vale la pena unificar, hazlo en un solo llamado
+    if len(transcript) <= chunk_chars:
+        logger.info(f"Resumen en bloque unico (corto) | {len(transcript):,} chars | chunk={chunk_chars}")
+        prompt = _build_summary_prompt(transcript, materia=materia)
+        result = await _call_ai(prompt)
+        return clean_html(result)
 
     chunks = _split_transcript(transcript, max_chars=chunk_chars)
     total = len(chunks)
+    if total == 0:
+        raise AIServiceUnavailable("No hay contenido para resumir")
+
+    logger.info(f"Resumen en bloques (Modo Obrero) | {len(transcript):,} chars | {total} secciones | chunk={chunk_chars}")
+
     partials: list[str] = []
-
-    logger.info(
-        f"Resumen IA en dos fases | {len(transcript):,} chars | {total} secciones | "
-        f"chunk_chars={chunk_chars}"
-    )
-
-    for i, chunk in enumerate(chunks):
-        section = i + 1
+    for idx, chunk in enumerate(chunks):
+        section = idx + 1
         if progress_callback:
-            pct = (i / max(total, 1)) * 70
-            await progress_callback(pct, f"Procesando seccion {section} de {total}")
+            await progress_callback((idx / max(total, 1)) * 70, f"Procesando seccion {section} de {total}")
 
         prompt = _build_chunk_prompt(chunk, section, total, materia=materia)
-        summary = await _call_ai(prompt)
-        if summary:
-            partials.append(summary)
-        else:
-            partials.append("<p><em>[Seccion no procesada]</em></p>")
+        partial = await _call_ai(prompt) # Usa el modelo economico (Gemini 3.1 Lite) por defecto
+        partials.append(clean_html(partial))
 
-        if i < total - 1:
-            await asyncio.sleep(GROQ_REQUEST_DELAY)
-
-    valid_count = sum(1 for s in partials if "[Seccion no procesada]" not in s)
-    if valid_count == 0:
-        return _fallback_summary(transcript)
+        if idx < total - 1:
+            await asyncio.sleep(inter_chunk_delay)
 
     if progress_callback:
-        await progress_callback(85, "Combinando resumenes...")
+        await progress_callback(85, "Unificando con Modelo Maestro...")
 
-    await asyncio.sleep(min(GROQ_REQUEST_DELAY * 3, 30.0))
-    unified = await _unify_partials_resilient(partials, materia=materia)
-    if unified:
-        return unified
+    combined = "\n\n".join(f"<!-- Seccion {i + 1} -->\n{item}" for i, item in enumerate(partials))
+    
+    # REDUCE: Usamos el modelo supremo para rediseñar unicamente con la informacion procesada
+    unify_prompt = _build_unification_prompt(combined, transcript=transcript, materia=materia)
+    override_unifier = "gemini-2.5-flash" if primary == AIProvider.GEMINI else None
+    
+    if override_unifier:
+        logger.info(f"Ruta chunked - Unificando con modelo maestro: {override_unifier}")
 
-    logger.error("No se pudo unificar el resumen tras multiples intentos; usando fallback completo.")
-    return _fallback_summary(transcript)
+    try:
+        # Request con Try-Except
+        unified = await _call_ai(unify_prompt, override_model=override_unifier)
+        final_doc = clean_html(unified)
+    except AIServiceUnavailable:
+        logger.warning("Unificacion con modelo maestro fallo, reintentando...")
+        await asyncio.sleep(2.0)
+        unified = await _call_ai(unify_prompt, override_model=override_unifier)
+        final_doc = clean_html(unified)
+
+    return final_doc
 
 
 def _fallback_summary(transcript: str) -> str:
-    word_count = len(transcript.split()) if transcript else 0
-    duration = word_count / 150 if word_count else 0
-    return f"""<h1>📚 Resumen de Clase</h1>
+    words = _word_count(transcript)
+    minutes = (words / 150) if words else 0.0
 
-<h2>📋 Informacion</h2>
+    return f"""<h1>Resumen de la sesion</h1>
+<h2>Resumen Ejecutivo</h2>
+<p>No fue posible generar el resumen con IA en este intento.</p>
+<h2>Desarrollo Tematico</h2>
+<p>No se pudo desarrollar el contenido tematico automaticamente.</p>
+<h2>Herramientas y Recursos</h2>
+<p>No se detectaron herramientas o recursos en esta salida minima.</p>
+<h2>Tareas y acciones</h2>
+<p><strong>No se mencionaron tareas, examenes ni fechas de entrega en esta clase.</strong></p>
+<h2>Preguntas de repaso</h2>
+<p>Revisa la transcripcion completa para reconstruir los puntos clave.</p>
+<h2>Informacion disponible</h2>
 <ul>
-  <li><strong>Duracion estimada:</strong> {duration:.0f} minutos</li>
-  <li><strong>Palabras:</strong> {word_count:,}</li>
+  <li><strong>Palabras en transcripcion:</strong> {words:,}</li>
+  <li><strong>Duracion estimada:</strong> {minutes:.0f} minutos</li>
 </ul>
-
-<h2>📝 Acciones Requeridas</h2>
-<p>No fue posible generar el resumen con IA. Revisa la transcripcion para:</p>
-<ul>
-  <li>Identificar tareas y fechas de entrega</li>
-  <li>Extraer conceptos clave</li>
-  <li>Documentar procedimientos</li>
-</ul>
-
-<hr>
-<p><em>Resumen automatico - revisar transcripcion para detalles.</em></p>"""
+<h2>Proximos pasos sugeridos</h2>
+<p>Reintenta el proceso o revisa conectividad y configuracion del proveedor de IA.</p>
+"""
 
 
 async def summarize(transcript: str, materia: str, progress_callback=None) -> str:
+    started_at = time.perf_counter()
     if not transcript or len(transcript.strip()) < 50:
-        return _fallback_summary(transcript)
+        fallback_html = _fallback_summary(transcript)
+        logger.info(
+            "Resumen metrics | status=fallback | reason=transcript-corto | "
+            f"in_chars={len(transcript or '')} | out_chars={len(fallback_html)} | "
+            f"out_words={_word_count(fallback_html)} | duration_ms={(time.perf_counter() - started_at) * 1000:.0f}"
+        )
+        return fallback_html
 
     primary = _detect_primary_provider()
     if primary == AIProvider.DISABLED:
-        return _fallback_summary(transcript)
+        fallback_html = _fallback_summary(transcript)
+        logger.info(
+            "Resumen metrics | status=fallback | reason=sin-proveedor | "
+            f"in_chars={len(transcript)} | out_chars={len(fallback_html)} | "
+            f"out_words={_word_count(fallback_html)} | duration_ms={(time.perf_counter() - started_at) * 1000:.0f}"
+        )
+        return fallback_html
 
-    provider_model = _get_provider_model(primary)
-    max_single = 500000 if primary == AIProvider.GEMINI else 30000
-    if MAX_TRANSCRIPT_SIZE_SINGLE > 0:
-        max_single = min(max_single, MAX_TRANSCRIPT_SIZE_SINGLE)
+    model = (
+        GEMINI_MODEL
+        if primary == AIProvider.GEMINI
 
-    logger.info(
-        f"Generando resumen | {len(transcript):,} chars | proveedor={primary.value} | modelo={provider_model}"
+        else OLLAMA_MODEL
     )
 
-    if len(transcript) > max_single:
-        return await _generate_two_phase_summary(transcript, materia, progress_callback=progress_callback)
+    max_single = 150000 if primary == AIProvider.GEMINI else 30000
+    if MAX_TRANSCRIPT_SIZE_SINGLE > 0:
+        max_single = max(MAX_TRANSCRIPT_SIZE_SINGLE, 150000)
+
+    route = "chunked" if len(transcript) > max_single else "single"
+    
+    # User's request: route single to gemini-2.5-flash
+    override_model = "gemini-2.5-flash" if route == "single" and primary == AIProvider.GEMINI else None
+    
+    actual_model = override_model if override_model else model
+    logger.info(f"Generando resumen | {len(transcript):,} chars | proveedor={primary.value} | modelo={actual_model}")
 
     if progress_callback:
         await progress_callback(20, "Generando resumen...")
 
-    prompt = _build_single_phase_prompt(transcript, materia=materia)
-    result = await _call_ai(prompt)
-    if result:
-        return clean_html(result)
-    return _fallback_summary(transcript)
+    if len(transcript) > max_single:
+        summary_html = await _summarize_chunks(transcript, materia, progress_callback=progress_callback)
+    else:
+        # Use single pass with override_model if gemini
+        if override_model:
+            logger.info(f"Ruta single - Usando modelo mas capaz y limitante para textos cortos: {override_model}")
+        prompt = _build_summary_prompt(transcript, materia=materia)
+        summary_html = clean_html(await _call_ai(prompt, override_model))
+
+# Verificacion basica (solo si devuelven vacio completo, que es falla catastrofica)
+    if not summary_html or not summary_html.strip() or len(summary_html) < 50:
+        logger.warning("Resumen IA devolvio salida vacia. Se usa fallback")
+        fallback_html = _fallback_summary(transcript)
+        logger.info(
+            "Resumen metrics | status=fallback | reason=salida_vacia | "
+            f"provider={primary.value} | route={route} | "
+            f"in_chars={len(transcript)} | out_chars={len(fallback_html)} | "
+            f"duration_ms={(time.perf_counter() - started_at) * 1000:.0f}"
+        )
+        return fallback_html
+
+    logger.info(
+        "Resumen metrics | status=ok | "
+        f"provider={primary.value} | route={route} | "
+        f"in_chars={len(transcript)} | out_chars={len(summary_html)} | out_words={_word_count(summary_html)} | "
+        f"duration_ms={(time.perf_counter() - started_at) * 1000:.0f}"
+    )
+
+    return summary_html
 
 
 def clean_html(raw: str) -> str:
@@ -562,5 +687,6 @@ def clean_html(raw: str) -> str:
         text = text.replace(marker, "")
     text = text.strip()
     if text and not text.startswith("<"):
-        text = f"<h1>📚 Resumen de Clase</h1>\n{text}"
+        text = f"<h1>Resumen de la sesion</h1>\n<p>{text}</p>"
     return text.strip()
+
