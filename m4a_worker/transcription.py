@@ -1,7 +1,9 @@
 import asyncio
 import ctypes
 import os
+import re
 import time
+import unicodedata
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
@@ -31,6 +33,25 @@ _cuda_dll_configured = False
 _cuda_dll_handles = []
 _cuda_dll_dirs: list[Path] = []
 _cuda_runtime_loaded = False
+
+ACADEMIC_ACTIVITY_HINTS = (
+    "tarea",
+    "tareas",
+    "taller",
+    "talleres",
+    "entrega",
+    "entregable",
+    "entregables",
+    "fecha limite",
+    "fecha de entrega",
+    "proxima clase",
+    "examen",
+    "parcial",
+    "quiz",
+    "quices",
+    "sustentacion",
+    "proyecto",
+)
 
 
 def _configure_cuda_dll_dirs() -> None:
@@ -205,9 +226,24 @@ def _build_whisper_kwargs(audio_path: str) -> dict:
     }
 
 
+def _normalize_for_match(text: str) -> str:
+    normalized = unicodedata.normalize("NFKD", text.lower())
+    ascii_text = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    return re.sub(r"\s+", " ", ascii_text).strip()
+
+
+def _contains_academic_activity_marker(text: str) -> bool:
+    normalized_text = _normalize_for_match(text)
+    return any(hint in normalized_text for hint in ACADEMIC_ACTIVITY_HINTS)
+
+
 def _is_hallucination(text: str) -> bool:
     if not text or len(text.strip()) < 10:
         return True
+
+    # Conserva segmentos relevantes para tareas/fechas aunque tengan repeticiones.
+    if _contains_academic_activity_marker(text):
+        return False
 
     words = text.lower().split()
     if len(words) < 2:
@@ -360,7 +396,7 @@ async def transcribe_file_with_progress(
                 except asyncio.TimeoutError:
                     continue
 
-                percent = min(99, max(0, int(ratio * 100)))
+                percent = min(55, max(5, int(ratio * 50) + 5))
                 now = time.monotonic()
 
                 if percent > last_percent and (now - last_sent_ts >= 1.0 or percent - last_percent >= 2):

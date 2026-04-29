@@ -192,10 +192,10 @@ class JobProcessor:
         transcript: str,
         progress_callback: Callable[[int, str], Awaitable[None]] | None = None,
     ) -> str:
-        await self._emit_progress(client, data.nota_id, 99, "Generando resumen con IA", progress_callback)
+        await self._emit_progress(client, data.nota_id, 60, "Generando resumen con IA", progress_callback)
 
         async def ai_progress(percent: float, message: str):
-            mapped = min(99, max(70, int(70 + (percent / 100) * 29)))
+            mapped = min(99, max(60, int(60 + (percent / 100) * 39)))
             await self._emit_progress(client, data.nota_id, mapped, f"IA: {message}", progress_callback)
 
         html = await summarize(transcript, data.materia, progress_callback=ai_progress)

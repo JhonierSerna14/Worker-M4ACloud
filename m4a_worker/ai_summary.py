@@ -1,4 +1,5 @@
-﻿import asyncio
+import asyncio
+import random
 import re
 import time
 import unicodedata
@@ -11,10 +12,13 @@ from .config import (
     AI_CHUNK_MAX_CHARS,
     AI_REQUEST_TIMEOUT,
     AI_TEMPERATURE,
+    DEFAULT_MAX_SINGLE_CHARS,
     GEMINI_API_KEY,
+    GEMINI_CHUNK_CHARS,
     GEMINI_FALLBACK_MODEL,
     GEMINI_MAX_ATTEMPTS,
     GEMINI_MAX_OUTPUT_TOKENS,
+    GEMINI_MAX_SINGLE_CHARS,
     GEMINI_MODEL,
     MAX_TRANSCRIPT_SIZE_SINGLE,
     OLLAMA_BASE_URL,
@@ -31,20 +35,29 @@ from .config import (
     SUMMARY_TARGET_WORDS_MIN,
 )
 
+ACADEMIC_LOAD_SECTION_TITLE = "📝 Carga Academica y Fechas Importantes"
+NO_TASKS_MESSAGE = (
+    "<p><strong>No fue posible identificar actividades o fechas de entrega de forma confiable en esta salida. "
+    "Revisar transcripcion completa para confirmar.</strong></p>"
+)
+LONG_AUDIO_THRESHOLD_CHARS = 50000
+GEMINI_LONG_AUDIO_FALLBACK_MODEL = "gemini-3.1-flash-lite-preview"
+
 SYSTEM_PROMPT = (
     "Eres un asistente academico hiper-detallista especializado en crear apuntes exhaustivos de clase a partir de "
     "transcripciones de audio. Tu trabajo es EXTRAER, PRESERVAR y ORGANIZAR fielmente el contenido "
     "real de la clase. ESTA PROHIBIDO hacer resúmenes genéricos o superficiales.\n\n"
     "REGLA FUNDAMENTAL: Tienes que mencionar TODOS los ejemplos específicos, anécdotas, casos de estudio, "
     "herramientas, empresas, y datos técnicos que el profesor haya mencionado en la transcripcion.\n"
-    "Prioriza una profundidad extrema, estructurando paso a paso mediante listas largas y detalladas. "
+    "Prioriza una lectura fluida, continua y académica en párrafos bien estructurados. Usa listas de forma moderada, "
+    "solo para enumerar conceptos concretos o pasos."
 )
 
 HTML_FORMAT_RULES = """
 REGLAS DE FORMATO (HTML puro, sin Markdown ni bloques de codigo):
 - Usa <h1> para el titulo principal, <h2> para secciones y <h3> para subsecciones por cada bloque discutido.
-- OBLIGATORIO: Usa listas extensas (<ul> y <li>) para desglosar TODO el detalle, explicaciones y ejemplos puntuales. Protege la granularidad de la información.
-- Usa parrafos explicativos (<p>) para introducir conceptos o historias, y luego desglosa los hechos con viñetas.
+- Escribe el desarrollo de los temas empleando párrafos extensos y fluidos (<p>), asegurando una lectura coherente, continua y de inmersión.
+- Usa listas (<ul> y <li>) de manera MODERADA, únicamente para agrupar elementos concretos, enumerar pasos de un proceso o listar ventajas/desventajas. NO conviertas el texto en un esquema gigante de viñetas.
 - Usa <table> para cronogramas o comparaciones.
 - Usa <strong>, <em> para resaltar terminos clave.
 - NO incluyas ```html, ``` ni estilos inline.
@@ -52,17 +65,20 @@ REGLAS DE FORMATO (HTML puro, sin Markdown ni bloques de codigo):
 
 TASK_DETECTION_RULES = """
 SECCION DE TAREAS Y ACCIONES (MUY IMPORTANTE):
-- Busca minuciosamente menciones a talleres, trabajos, ejercicios, tareas, examenes, parciales, quices, entregas, "para la proxima clase", lecturas, proyectos o "pitch".
-- Si hay menciones a evaluaciones, proyectos o sustentaciones, plásmalo con alto detalle en <h2>📝 Carga Academica y Fechas Importantes</h2>.
-- Si genuinamente no hay menciones, escribe:
-  <p><strong>No se mencionaron tareas, examenes ni fechas de entrega en esta clase.</strong></p>
+- Tu máxima prioridad como asistente es extraer ENTREGABLES, TAREAS, EXPOSICIONES, PRESENTACIONES, parciales, quices, lecturas o "para la próxima clase". Presta atención especial a instrucciones operativas.
+- Documentalas en <h2>📝 Carga Academica y Fechas Importantes</h2> usando <ul><li>.
+- Para CADA actividad debes incluir OBLIGATORIAMENTE: 1) Tipo de actividad en negrita (ej. <strong>Exposición final</strong>), 2) Instrucciones exactas y contexto de qué hay que hacer, 3) Fecha o plazo exacto, 4) Una evidencia textual corta.
+- No omitas actividades por falta de fecha exacta; usa "Fecha no especificada".
+- Esta sección es CRÍTICA para el estudiante. Escudriña cada párrafo de la transcripción para encontrar compromisos académicos.
+- Si genuinamente tras revisar todo no hay ninguna mención, escribe exactamente:
+    <p><strong>No se identificaron tareas, exposiciones ni fechas de entrega explícitas en la transcripción.</strong></p>
 """.strip()
 
 EXPANDED_NOTES_RULES = """
 ESTILO DE APUNTES EXPANDIDOS (NO resumen corto):
 - Actua como transcriptor y editor academico: recupera la mayor cantidad posible de la clase.
-- Exploralos a fondo: desarrolla el contexto, argumentos, TODOS los ejemplos concretos (nombres de empresas, tecnologías, situaciones históricas) y casos de estudio.
-- Enumera fuertemente con <ul> y <li> para desgranar características o componentes, garantizando fidelidad absoluta.
+- Exploralos a fondo: desarrolla el contexto, argumentos, TODOS los ejemplos concretos (nombres de empresas, tecnologías, situaciones históricas) y casos de estudio en bloques de texto continuo.
+- Entrelaza las ideas con buena redacción en lugar de recurrir al facilismo de crear infinitas sublistas. El estudiante debe sentir que está leyendo un libro de texto creado de la clase, fluido y completo.
 """.strip()
 
 
@@ -73,6 +89,20 @@ class AIProvider(Enum):
 
 
 PROVIDER_RATE_LIMIT_UNTIL: dict[str, float] = {}
+
+# ---------------------------------------------------------------------------
+# Cliente HTTP reutilizable (connection pooling — evita overhead por request)
+# ---------------------------------------------------------------------------
+
+_ai_http_client: httpx.AsyncClient | None = None
+
+
+def _get_ai_http_client() -> httpx.AsyncClient:
+    """Retorna el cliente httpx compartido para llamadas a APIs de IA."""
+    global _ai_http_client
+    if _ai_http_client is None or _ai_http_client.is_closed:
+        _ai_http_client = httpx.AsyncClient(timeout=AI_REQUEST_TIMEOUT)
+    return _ai_http_client
 
 
 class AIServiceUnavailable(RuntimeError):
@@ -131,11 +161,12 @@ ESTRUCTURA REQUERIDA (HTML puro):
 <p>[2-3 parrafos sobre lo cubierto, el enfoque de la clase y expectativas para el estudiante.]</p>
 <h2>📖 Desarrollo Tematico</h2>
 [Crea un Subcapitulo <h3> distinto por cada bloque y sub-tema. MENCIONA los ejemplos específicos. ]
-[Usa OBLIGATORIAMENTE múltiples listas y viñetas detalladas <ul> <li> largas para capturar la esencia completa.]
-[NO omitas anécdotas, analogías históricas ni empresas mencionadas.]
+[Desarrolla el contenido profundo en párrafos completos, extensos y conectados (<p>). Mantén la continuidad argumentativa de la clase.]
+[Usa listas <ul><li> SOLO cuando sea indispensable enumerar. Evita el abuso de viñetas.]
+[NO omitas anécdotas, analogías históricas, debates ni empresas mencionadas.]
 <h2>🛠 Herramientas y Recursos</h2>
 [Solo si se mencionaron recursos.]
-<h2>📝 Carga Academica y Fechas Importantes</h2>
+<h2>{ACADEMIC_LOAD_SECTION_TITLE}</h2>
 [Instrucciones y plazos detallados a los que el estudiante debe prestar atencion.]
 <h2>🧠 Preguntas de Repaso</h2>
 [Generar al menos 5 preguntas de formato detallado derivadas de lo visto, para poner a prueba el conocimiento.]
@@ -143,7 +174,8 @@ ESTRUCTURA REQUERIDA (HTML puro):
 REGLAS DE CALIDAD:
 - Desarrolla ideas en parrafos completos y conectados.
 - Incluye ejemplos, decisiones, argumentos y matices presentes en la transcripcion.
-- En "Carga Academica y Fechas Importantes" incluye tareas, plazos y actividades; si no existen, indicarlo explicitamente.
+- En "Carga Academica y Fechas Importantes" prioriza recall: incluye SIEMPRE tareas, talleres, entregables, quices/parciales/examenes y fechas limite explicitas si aparecen.
+- Para cada actividad agrega evidencia textual corta (frase breve o parafrasis fiel).
 - Evita frases meta sobre tus limitaciones como modelo.
 
 {HTML_FORMAT_RULES}
@@ -166,9 +198,11 @@ OBJETIVO:
 
 FORMATO:
 - Empieza con <h3>[Tema detectado]</h3> en cada idea fuerte.
-- Empuja la descripcion de contextos, matices y ejemplos con varias sub-viñetas <ul> y <li>.
-- Usa varios <p> amplios solamente para conectar viñetas.
-- Identifica desde ya insumos para la obligatoria seccion final <h2>📝 Carga Academica y Fechas Importantes</h2>.
+- Escribe la descripción de contextos, matices y ejemplos de forma narrativa y continua dentro de párrafos <p>.
+- Usa listas <ul> y <li> de manera restringida, solo si hay que hacer enumeraciones obvias.
+- El texto debe fluir lógicamente como un libro de apuntes.
+- Identifica desde ya insumos para la obligatoria seccion final <h2>{ACADEMIC_LOAD_SECTION_TITLE}</h2>.
+- Si hay actividad academica en este fragmento, reportala aunque sea parcial e incluye fecha/plazo si se menciona.
 
 {HTML_FORMAT_RULES}
 {TASK_DETECTION_RULES}
@@ -197,13 +231,13 @@ ESTRUCTURA REQUERIDA (HTML puro):
 <p>[Sintesis general estructurada de todo el arco de conocimiento abarcado]</p>
 
 <h2>📖 Desarrollo Tematico</h2>
-[Agrupa o enlaza los temas dispersos en los borradores empleando inteligentemente etiquetas <h3>. Desarrolla las ideas profundamente con viñetas largas <ul><li>, conservando anécdotas, nombres, y citas dadas en los borradores.]
+[Agrupa o enlaza los temas dispersos en los borradores empleando inteligentemente etiquetas <h3>. Desarrolla las ideas de forma inmersiva y continua con múltiples párrafos <p> bien conectados, conservando anécdotas, nombres y citas. Modera el uso de viñetas para lo estrictamente numerativo.]
 
 <h2>🛠️ Herramientas y Recursos</h2>
 [Extrae todas las plataformas o recursos de los borradores en una lista.]
 
-<h2>📅 Carga Academica y Fechas Importantes</h2>
-[Consolida TODAS las actividades, lecturas o tareas. Si ninguna de las partes aporta algo, pon <p><strong>No se mencionaron tareas, examenes ni fechas de entrega en toda la clase.</strong></p>]
+<h2>{ACADEMIC_LOAD_SECTION_TITLE}</h2>
+[Consolida TODAS las actividades, lecturas o tareas. Para cada actividad, conserva fecha/plazo y evidencia corta. Si ninguna parte aporta algo, pon <p><strong>No se identificaron tareas, examenes ni fechas de entrega de forma explicita en la transcripcion.</strong></p>]
 
 <h2>🧠 Preguntas de Repaso</h2>
 [Construye 5-8 preguntas estrategicas cruzando lo más vital enseñado.]
@@ -261,6 +295,31 @@ def _parse_retry_after(value: str) -> float:
         return 0.0
 
 
+def _transient_retry_delay(attempt: int, base: float = 1.2, cap: float = 8.0) -> float:
+    # Backoff exponencial con jitter para errores transitorios (5xx/timeouts).
+    exp = min(cap, base * (2 ** max(0, attempt)))
+    return exp + random.uniform(0.0, 0.8)
+
+
+def _truncate_prompt_head_tail(prompt_text: str, max_chars: int) -> str:
+    marker = "\n\n...[TRUNCADO_INTERMEDIO]...\n\n"
+    head_chars = int(max_chars * 0.55)
+    tail_chars = max(0, max_chars - head_chars - len(marker))
+    return f"{prompt_text[:head_chars]}{marker}{prompt_text[-tail_chars:] if tail_chars else ''}"
+
+
+def _split_prompt_transcript(prompt_text: str) -> tuple[str, str] | None:
+    marker = "TRANSCRIPCION:\n"
+    idx = prompt_text.find(marker)
+    if idx < 0:
+        return None
+    prefix = prompt_text[: idx + len(marker)]
+    transcript = prompt_text[idx + len(marker):].strip()
+    if not transcript:
+        return None
+    return prefix, transcript
+
+
 def _is_rate_limited(provider: AIProvider) -> bool:
     until = PROVIDER_RATE_LIMIT_UNTIL.get(provider.value)
     if not until:
@@ -308,11 +367,6 @@ def _estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
-    if "8b" in lower:
-        return 5500
-    return 7000
-
-
 def _model_candidates(provider: AIProvider) -> list[str]:
     if provider == AIProvider.GEMINI:
         candidates = [GEMINI_MODEL, GEMINI_FALLBACK_MODEL]
@@ -325,11 +379,22 @@ def _model_candidates(provider: AIProvider) -> list[str]:
 
 
 
-async def _call_gemini(prompt: str, override_model: str = None) -> str | None:
+async def _call_gemini(
+    prompt: str,
+    override_model: str = None,
+    secondary_model: str = None,
+) -> str | None:
     if not GEMINI_API_KEY:
         return None
 
-    candidates = [override_model] if override_model else _model_candidates(AIProvider.GEMINI)
+    if override_model:
+        candidates = [override_model]
+        if secondary_model:
+            candidates.append(secondary_model)
+        candidates.extend(_model_candidates(AIProvider.GEMINI))
+        candidates = [model for model in dict.fromkeys(candidates) if model]
+    else:
+        candidates = _model_candidates(AIProvider.GEMINI)
     for model in candidates:
         url = (
             "https://generativelanguage.googleapis.com/v1beta/models/"
@@ -347,8 +412,8 @@ async def _call_gemini(prompt: str, override_model: str = None) -> str | None:
 
         for attempt in range(max(1, GEMINI_MAX_ATTEMPTS)):
             try:
-                async with httpx.AsyncClient(timeout=AI_REQUEST_TIMEOUT) as http_client:
-                    resp = await http_client.post(url, json=payload, headers={"Content-Type": "application/json"})
+                http_client = _get_ai_http_client()
+                resp = await http_client.post(url, json=payload, headers={"Content-Type": "application/json"})
 
                 if resp.status_code == 429:
                     wait_seconds = _parse_retry_after(resp.headers.get("retry-after", ""))
@@ -357,7 +422,19 @@ async def _call_gemini(prompt: str, override_model: str = None) -> str | None:
                     logger.warning(f"Rate limit [gemini] modelo={model}; intento fallback")
                     break
 
-                if resp.status_code in {404, 500, 502, 503, 504}:
+                if resp.status_code == 404:
+                    logger.warning(f"Gemini devolvio 404 en modelo={model}; probando siguiente")
+                    break
+
+                if resp.status_code in {500, 502, 503, 504}:
+                    if attempt + 1 < max(1, GEMINI_MAX_ATTEMPTS):
+                        wait_seconds = _transient_retry_delay(attempt)
+                        logger.warning(
+                            f"Gemini devolvio {resp.status_code} en modelo={model}; "
+                            f"reintento {attempt + 2}/{max(1, GEMINI_MAX_ATTEMPTS)} en {wait_seconds:.1f}s"
+                        )
+                        await asyncio.sleep(wait_seconds)
+                        continue
                     logger.warning(f"Gemini devolvio {resp.status_code} en modelo={model}; probando siguiente")
                     break
 
@@ -382,12 +459,12 @@ async def _call_gemini(prompt: str, override_model: str = None) -> str | None:
                             "maxOutputTokens": GEMINI_MAX_OUTPUT_TOKENS,
                         },
                     }
-                    async with httpx.AsyncClient(timeout=AI_REQUEST_TIMEOUT) as cont_client:
-                        cont_resp = await cont_client.post(
-                            url,
-                            json=continuation_payload,
-                            headers={"Content-Type": "application/json"},
-                        )
+                    cont_client = _get_ai_http_client()
+                    cont_resp = await cont_client.post(
+                        url,
+                        json=continuation_payload,
+                        headers={"Content-Type": "application/json"},
+                    )
                     if cont_resp.status_code < 400:
                         cont_data = cont_resp.json()
                         cont_candidates = cont_data.get("candidates", [])
@@ -403,6 +480,14 @@ async def _call_gemini(prompt: str, override_model: str = None) -> str | None:
                     return text
                 return None
             except httpx.TimeoutException:
+                if attempt + 1 < max(1, GEMINI_MAX_ATTEMPTS):
+                    wait_seconds = _transient_retry_delay(attempt)
+                    logger.warning(
+                        f"Timeout [gemini] modelo={model} intento {attempt + 1}/{max(1, GEMINI_MAX_ATTEMPTS)}; "
+                        f"reintentando en {wait_seconds:.1f}s"
+                    )
+                    await asyncio.sleep(wait_seconds)
+                    continue
                 logger.warning(
                     f"Timeout [gemini] modelo={model} intento {attempt + 1}/{max(1, GEMINI_MAX_ATTEMPTS)}"
                 )
@@ -421,12 +506,6 @@ async def _call_gemini(prompt: str, override_model: str = None) -> str | None:
 async def _call_ollama(prompt: str) -> str | None:
     base_url = OLLAMA_BASE_URL.rstrip("/")
     prompt_text = prompt
-    if len(prompt_text) > OLLAMA_SAFE_PROMPT_CHARS:
-        logger.warning(
-            f"Prompt grande para Ollama ({len(prompt_text):,} chars). "
-            f"Recortando a {OLLAMA_SAFE_PROMPT_CHARS:,} chars."
-        )
-        prompt_text = prompt_text[:OLLAMA_SAFE_PROMPT_CHARS]
 
     timeout = httpx.Timeout(
         connect=OLLAMA_CONNECT_TIMEOUT,
@@ -448,65 +527,127 @@ async def _call_ollama(prompt: str) -> str | None:
                 logger.warning(f"Ollama: modelo '{model}' no disponible. Usando '{available[0]}'")
                 model = available[0]
 
-            for attempt in range(max(1, OLLAMA_MAX_ATTEMPTS)):
-                payload = {
-                    "model": model,
-                    "messages": [
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": prompt_text},
-                    ],
-                    "stream": False,
-                    "options": {
-                        "temperature": AI_TEMPERATURE,
-                        "num_predict": OLLAMA_NUM_PREDICT,
-                    },
-                }
+            async def _send_ollama(user_prompt: str) -> str | None:
+                for attempt in range(max(1, OLLAMA_MAX_ATTEMPTS)):
+                    payload = {
+                        "model": model,
+                        "messages": [
+                            {"role": "system", "content": SYSTEM_PROMPT},
+                            {"role": "user", "content": user_prompt},
+                        ],
+                        "stream": False,
+                        "options": {
+                            "temperature": AI_TEMPERATURE,
+                            "num_predict": OLLAMA_NUM_PREDICT,
+                        },
+                    }
 
-                try:
-                    resp = await http_client.post(f"{base_url}/api/chat", json=payload)
-                    resp.raise_for_status()
-                    data = resp.json() if resp.content else {}
-                    content = (data.get("message", {}).get("content") or "").strip()
-                    if content:
-                        return content
-                except httpx.TimeoutException:
-                    logger.warning(
-                        f"Timeout [ollama] intento {attempt + 1}/{max(1, OLLAMA_MAX_ATTEMPTS)}"
-                    )
-                    if attempt + 1 < max(1, OLLAMA_MAX_ATTEMPTS):
-                        await asyncio.sleep(OLLAMA_RETRY_DELAY)
-                        continue
-                    return None
-                except httpx.HTTPStatusError as exc:
-                    logger.error(f"HTTP {exc.response.status_code} [ollama]: {exc.response.text[:200]}")
-                    if 400 <= exc.response.status_code < 500:
+                    try:
+                        resp = await http_client.post(f"{base_url}/api/chat", json=payload)
+                        resp.raise_for_status()
+                        data = resp.json() if resp.content else {}
+                        content = (data.get("message", {}).get("content") or "").strip()
+                        if content:
+                            return content
+                    except httpx.TimeoutException:
+                        logger.warning(
+                            f"Timeout [ollama] intento {attempt + 1}/{max(1, OLLAMA_MAX_ATTEMPTS)}"
+                        )
+                        if attempt + 1 < max(1, OLLAMA_MAX_ATTEMPTS):
+                            await asyncio.sleep(OLLAMA_RETRY_DELAY)
+                            continue
                         return None
-                    if attempt + 1 < max(1, OLLAMA_MAX_ATTEMPTS):
-                        await asyncio.sleep(OLLAMA_RETRY_DELAY)
-                        continue
-                    return None
-                except Exception as exc:
-                    logger.error(f"Error [ollama] intento {attempt + 1}: {type(exc).__name__}: {exc}")
-                    if attempt + 1 < max(1, OLLAMA_MAX_ATTEMPTS):
-                        await asyncio.sleep(OLLAMA_RETRY_DELAY)
-                        continue
-                    return None
+                    except httpx.HTTPStatusError as exc:
+                        logger.error(f"HTTP {exc.response.status_code} [ollama]: {exc.response.text[:200]}")
+                        if 400 <= exc.response.status_code < 500:
+                            return None
+                        if attempt + 1 < max(1, OLLAMA_MAX_ATTEMPTS):
+                            await asyncio.sleep(OLLAMA_RETRY_DELAY)
+                            continue
+                        return None
+                    except Exception as exc:
+                        logger.error(f"Error [ollama] intento {attempt + 1}: {type(exc).__name__}: {exc}")
+                        if attempt + 1 < max(1, OLLAMA_MAX_ATTEMPTS):
+                            await asyncio.sleep(OLLAMA_RETRY_DELAY)
+                            continue
+                        return None
+                return None
+
+            if len(prompt_text) > OLLAMA_SAFE_PROMPT_CHARS:
+                split_payload = _split_prompt_transcript(prompt_text)
+
+                if split_payload is not None:
+                    prompt_prefix, transcript = split_payload
+                    target_chunks = min(6, max(2, (len(transcript) + 15999) // 16000))
+                    chunk_chars = max(5000, len(transcript) // target_chunks)
+                    chunks = _split_transcript(transcript, max_chars=chunk_chars)
+
+                    logger.warning(
+                        f"Prompt grande para Ollama ({len(prompt_text):,} chars). "
+                        f"Aplicando map-reduce con {len(chunks)} fragmentos."
+                    )
+
+                    partials: list[str] = []
+                    for idx, chunk in enumerate(chunks):
+                        chunk_prompt = (
+                            f"{prompt_prefix}\n"
+                            f"[FRAGMENTO {idx + 1}/{len(chunks)}]\n"
+                            f"{chunk}\n\n"
+                            "INSTRUCCION ADICIONAL: Extrae apuntes parciales fieles en HTML, "
+                            "priorizando actividades, entregables y fechas. No inventes informacion."
+                        )
+                        if len(chunk_prompt) > OLLAMA_SAFE_PROMPT_CHARS:
+                            chunk_prompt = _truncate_prompt_head_tail(chunk_prompt, OLLAMA_SAFE_PROMPT_CHARS)
+
+                        partial = await _send_ollama(chunk_prompt)
+                        if partial:
+                            partials.append(clean_html(partial))
+
+                    if partials:
+                        combined = "\n\n".join(
+                            f"<!-- Fragmento {i + 1} -->\n{item}" for i, item in enumerate(partials)
+                        )
+                        unify_prompt = _build_unification_prompt(combined, transcript="", materia="")
+                        if len(unify_prompt) > OLLAMA_SAFE_PROMPT_CHARS:
+                            unify_prompt = _truncate_prompt_head_tail(unify_prompt, OLLAMA_SAFE_PROMPT_CHARS)
+                        unified = await _send_ollama(unify_prompt)
+                        if unified:
+                            return unified
+                        # Si falla unificacion, retornar al menos el consolidado parcial.
+                        return combined
+
+                logger.warning(
+                    f"Prompt grande para Ollama ({len(prompt_text):,} chars). "
+                    f"Sin estructura de transcripcion, recortando a {OLLAMA_SAFE_PROMPT_CHARS:,} chars."
+                )
+                prompt_text = _truncate_prompt_head_tail(prompt_text, OLLAMA_SAFE_PROMPT_CHARS)
+
+            return await _send_ollama(prompt_text)
     except Exception as exc:
         logger.error(f"Error fatal [ollama]: {type(exc).__name__}: {exc}")
         return None
 
 
 
-async def _call_provider(provider: AIProvider, prompt: str, override_model: str = None) -> str | None:
+async def _call_provider(
+    provider: AIProvider,
+    prompt: str,
+    override_model: str = None,
+    secondary_model: str = None,
+) -> str | None:
     if provider == AIProvider.GEMINI:
-        return await _call_gemini(prompt, override_model)
+        return await _call_gemini(prompt, override_model, secondary_model)
 
     if provider == AIProvider.OLLAMA:
         return await _call_ollama(prompt)
     return None
 
 
-async def _call_ai(prompt: str, override_model: str = None) -> str:
+async def _call_ai(
+    prompt: str,
+    override_model: str = None,
+    gemini_secondary_model: str = None,
+) -> str:
     primary = _detect_primary_provider()
     if primary == AIProvider.DISABLED:
         raise AIServiceUnavailable("No hay proveedores de IA configurados")
@@ -515,7 +656,7 @@ async def _call_ai(prompt: str, override_model: str = None) -> str:
         if _is_rate_limited(provider):
             continue
 
-        result = await _call_provider(provider, prompt, override_model)
+        result = await _call_provider(provider, prompt, override_model, gemini_secondary_model)
         if result:
             logger.info(f"Respuesta IA generada con proveedor={provider.value}")
             return result
@@ -525,8 +666,7 @@ async def _call_ai(prompt: str, override_model: str = None) -> str:
 
 async def _summarize_chunks(transcript: str, materia: str, progress_callback=None) -> str:
     primary = _detect_primary_provider()
-    # Usamos 60k en modo "Obrero" (Map) para dividir la enorme clase a Gemini 3.1 Flash Lite 
-    chunk_chars = 60000 if primary == AIProvider.GEMINI else AI_CHUNK_MAX_CHARS
+    chunk_chars = GEMINI_CHUNK_CHARS if primary == AIProvider.GEMINI else AI_CHUNK_MAX_CHARS
     inter_chunk_delay = 0.1
 
 
@@ -562,9 +702,9 @@ async def _summarize_chunks(transcript: str, materia: str, progress_callback=Non
 
     combined = "\n\n".join(f"<!-- Seccion {i + 1} -->\n{item}" for i, item in enumerate(partials))
     
-    # REDUCE: Usamos el modelo supremo para rediseñar unicamente con la informacion procesada
+    # REDUCE: Usamos el modelo principal (configurado en GEMINI_MODEL) para unificar
     unify_prompt = _build_unification_prompt(combined, transcript=transcript, materia=materia)
-    override_unifier = "gemini-2.5-flash" if primary == AIProvider.GEMINI else None
+    override_unifier = GEMINI_MODEL if primary == AIProvider.GEMINI else None
     
     if override_unifier:
         logger.info(f"Ruta chunked - Unificando con modelo maestro: {override_unifier}")
@@ -593,8 +733,8 @@ def _fallback_summary(transcript: str) -> str:
 <p>No se pudo desarrollar el contenido tematico automaticamente.</p>
 <h2>Herramientas y Recursos</h2>
 <p>No se detectaron herramientas o recursos en esta salida minima.</p>
-<h2>Tareas y acciones</h2>
-<p><strong>No se mencionaron tareas, examenes ni fechas de entrega en esta clase.</strong></p>
+<h2>{ACADEMIC_LOAD_SECTION_TITLE}</h2>
+{NO_TASKS_MESSAGE}
 <h2>Preguntas de repaso</h2>
 <p>Revisa la transcripcion completa para reconstruir los puntos clave.</p>
 <h2>Informacion disponible</h2>
@@ -635,14 +775,19 @@ async def summarize(transcript: str, materia: str, progress_callback=None) -> st
         else OLLAMA_MODEL
     )
 
-    max_single = 150000 if primary == AIProvider.GEMINI else 30000
+    max_single = GEMINI_MAX_SINGLE_CHARS if primary == AIProvider.GEMINI else DEFAULT_MAX_SINGLE_CHARS
     if MAX_TRANSCRIPT_SIZE_SINGLE > 0:
-        max_single = max(MAX_TRANSCRIPT_SIZE_SINGLE, 150000)
+        max_single = max(20000, MAX_TRANSCRIPT_SIZE_SINGLE)
 
     route = "chunked" if len(transcript) > max_single else "single"
-    
-    # User's request: route single to gemini-2.5-flash
-    override_model = "gemini-2.5-flash" if route == "single" and primary == AIProvider.GEMINI else None
+    override_model = GEMINI_MODEL if route == "single" and primary == AIProvider.GEMINI else None
+    gemini_secondary_model = None
+    if (
+        route == "single"
+        and primary == AIProvider.GEMINI
+        and len(transcript) >= LONG_AUDIO_THRESHOLD_CHARS
+    ):
+        gemini_secondary_model = GEMINI_LONG_AUDIO_FALLBACK_MODEL
     
     actual_model = override_model if override_model else model
     logger.info(f"Generando resumen | {len(transcript):,} chars | proveedor={primary.value} | modelo={actual_model}")
@@ -656,8 +801,13 @@ async def summarize(transcript: str, materia: str, progress_callback=None) -> st
         # Use single pass with override_model if gemini
         if override_model:
             logger.info(f"Ruta single - Usando modelo mas capaz y limitante para textos cortos: {override_model}")
+            if gemini_secondary_model:
+                logger.info(
+                    "Ruta single larga - Si falla 2.5 tras reintentos, "
+                    f"probando fallback Gemini: {gemini_secondary_model}"
+                )
         prompt = _build_summary_prompt(transcript, materia=materia)
-        summary_html = clean_html(await _call_ai(prompt, override_model))
+        summary_html = clean_html(await _call_ai(prompt, override_model, gemini_secondary_model))
 
 # Verificacion basica (solo si devuelven vacio completo, que es falla catastrofica)
     if not summary_html or not summary_html.strip() or len(summary_html) < 50:
