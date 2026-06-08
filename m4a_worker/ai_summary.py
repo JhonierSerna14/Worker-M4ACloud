@@ -20,6 +20,7 @@ from .config import (
     GEMINI_MAX_OUTPUT_TOKENS,
     GEMINI_MAX_SINGLE_CHARS,
     GEMINI_MODEL,
+    GEMINI_TASKS_MODEL,
     MAX_TRANSCRIPT_SIZE_SINGLE,
     OLLAMA_BASE_URL,
     OLLAMA_CONNECT_TIMEOUT,
@@ -48,10 +49,29 @@ SYSTEM_PROMPT = (
     "transcripciones de audio. Tu trabajo es EXTRAER, PRESERVAR y ORGANIZAR fielmente el contenido "
     "real de la clase. ESTA PROHIBIDO hacer resúmenes genéricos o superficiales.\n\n"
     "REGLA FUNDAMENTAL: Tienes que mencionar TODOS los ejemplos específicos, anécdotas, casos de estudio, "
-    "herramientas, empresas, y datos técnicos que el profesor haya mencionado en la transcripcion.\n"
+    "herramientas, empresas, y datos técnicos que el profesor haya mencionado en la transcripcion. "
+    "Tu redacción debe ser creativa, inmersiva y rica en vocabulario, PERO tienes ESTRICTAMENTE PROHIBIDO inventar "
+    "información, hechos o ejemplos que no estén explícitamente en el audio. Mantén una fidelidad absoluta al contenido original.\n"
     "Prioriza una lectura fluida, continua y académica en párrafos bien estructurados. Usa listas de forma moderada, "
     "solo para enumerar conceptos concretos o pasos."
 )
+
+TASK_EXTRACTION_PROMPT = """
+Eres un analizador de texto estricto. Tu ÚNICO y EXCLUSIVO objetivo es extraer tareas, entregables, exposiciones y compromisos de la transcripción. 
+ESTÁ TERMINANTEMENTE PROHIBIDO REDACTAR UN RESUMEN DE LA CLASE. No incluyas introducciones, no generes apuntes de los temas vistos, no incluyas conclusiones.
+
+REGLAS DE FORMATO (OBLIGATORIAS):
+- Tu respuesta debe ser EXCLUSIVAMENTE código HTML puro. Cero Markdown. No uses ```html ni ```.
+- Inicia tu respuesta directamente con la etiqueta: <h2>📝 Carga Academica y Fechas Importantes</h2>
+- Usa una lista <ul> y <li> para desglosar las actividades. Si no hay, usa <p>.
+
+SECCION DE TAREAS Y ACCIONES:
+- Busca minuciosamente talleres, trabajos, ejercicios, examenes, parciales, entregas, lecturas, proyectos o exposiciones.
+- Para CADA actividad extraída incluye: 1) Tipo en negrita (ej. <strong>Exposición</strong>), 2) Instrucciones exactas, 3) Fecha exacta o "Fecha no especificada", 4) Evidencia textual corta entre comillas.
+- Si tras revisar TODO no hay NADA, tu respuesta debe ser ÚNICAMENTE:
+<h2>📝 Carga Academica y Fechas Importantes</h2>
+<p><strong>No se identificaron tareas, exposiciones ni fechas de entrega explícitas en la transcripción.</strong></p>
+""".strip()
 
 HTML_FORMAT_RULES = """
 REGLAS DE FORMATO (HTML puro, sin Markdown ni bloques de codigo):
@@ -166,20 +186,17 @@ ESTRUCTURA REQUERIDA (HTML puro):
 [NO omitas anécdotas, analogías históricas, debates ni empresas mencionadas.]
 <h2>🛠 Herramientas y Recursos</h2>
 [Solo si se mencionaron recursos.]
-<h2>{ACADEMIC_LOAD_SECTION_TITLE}</h2>
-[Instrucciones y plazos detallados a los que el estudiante debe prestar atencion.]
 <h2>🧠 Preguntas de Repaso</h2>
 [Generar al menos 5 preguntas de formato detallado derivadas de lo visto, para poner a prueba el conocimiento.]
 
 REGLAS DE CALIDAD:
 - Desarrolla ideas en parrafos completos y conectados.
 - Incluye ejemplos, decisiones, argumentos y matices presentes en la transcripcion.
-- En "Carga Academica y Fechas Importantes" prioriza recall: incluye SIEMPRE tareas, talleres, entregables, quices/parciales/examenes y fechas limite explicitas si aparecen.
-- Para cada actividad agrega evidencia textual corta (frase breve o parafrasis fiel).
+- En "Preguntas de Repaso" prioriza recall: incluye preguntas derivadas del material.
+- Para cada pregunta agrega un formato detallado.
 - Evita frases meta sobre tus limitaciones como modelo.
 
 {HTML_FORMAT_RULES}
-{TASK_DETECTION_RULES}
 {EXPANDED_NOTES_RULES}
 {materia_ctx}
 TRANSCRIPCION:
@@ -201,11 +218,8 @@ FORMATO:
 - Escribe la descripción de contextos, matices y ejemplos de forma narrativa y continua dentro de párrafos <p>.
 - Usa listas <ul> y <li> de manera restringida, solo si hay que hacer enumeraciones obvias.
 - El texto debe fluir lógicamente como un libro de apuntes.
-- Identifica desde ya insumos para la obligatoria seccion final <h2>{ACADEMIC_LOAD_SECTION_TITLE}</h2>.
-- Si hay actividad academica en este fragmento, reportala aunque sea parcial e incluye fecha/plazo si se menciona.
 
 {HTML_FORMAT_RULES}
-{TASK_DETECTION_RULES}
 {EXPANDED_NOTES_RULES}
 {materia_ctx}
 FRAGMENTO {section_num}/{total_sections}:
@@ -221,7 +235,7 @@ Tu trabajo es UNIFICAR estos apuntes aislados en un solo documento maestro, cohe
 OBJETIVO:
 - Reconstruir la clase entera con fluidez perfecta.
 - MANTENER Y FUNDIR TODO EL NIVEL DE DETALLE de los borradores en la seccion "Desarrollo Tematico". No omitas contenido valioso o ejemplos.
-- Extrapolar y generar las secciones obligatorias correctamente (Resumen Ejecutivo, Herramientas, Tareas, Preguntas).
+- Extrapolar y generar las secciones obligatorias correctamente (Resumen Ejecutivo, Herramientas, Preguntas).
 - El documento final NO debe parecer un compilado. Debe lucir como una obra maestra escrita de un solo tiron.
 
 ESTRUCTURA REQUERIDA (HTML puro):
@@ -236,9 +250,6 @@ ESTRUCTURA REQUERIDA (HTML puro):
 <h2>🛠️ Herramientas y Recursos</h2>
 [Extrae todas las plataformas o recursos de los borradores en una lista.]
 
-<h2>{ACADEMIC_LOAD_SECTION_TITLE}</h2>
-[Consolida TODAS las actividades, lecturas o tareas. Para cada actividad, conserva fecha/plazo y evidencia corta. Si ninguna parte aporta algo, pon <p><strong>No se identificaron tareas, examenes ni fechas de entrega de forma explicita en la transcripcion.</strong></p>]
-
 <h2>🧠 Preguntas de Repaso</h2>
 [Construye 5-8 preguntas estrategicas cruzando lo más vital enseñado.]
 
@@ -247,23 +258,12 @@ REGLAS DE CALIDAD:
 - Desarrolla las ideas, evita escribir un solo parrafo largo por tema, dividelo logicamente.
 
 {HTML_FORMAT_RULES}
-{TASK_DETECTION_RULES}
 {EXPANDED_NOTES_RULES}
 {materia_ctx}
 ---
 BORRADORES PARCIALES A UNIFICAR:
 {combined_summaries}
 """
-
-
-def _build_gemini_continuation_prompt(previous_text: str) -> str:
-    return (
-        "Continua exactamente desde donde termino tu respuesta anterior.\n"
-        "No reinicies secciones ni repitas texto.\n"
-        "Mantiene el mismo formato HTML y completa el contenido faltante.\n\n"
-        "RESPUESTA PREVIA:\n"
-        f"{previous_text}"
-    )
 
 
 def _split_transcript(transcript: str, max_chars: int) -> list[str]:
@@ -449,11 +449,18 @@ async def _call_gemini(
                 text = "\n".join(part.get("text", "") for part in parts if part.get("text")).strip()
                 finish_reason = (selected.get("finishReason") or "").upper()
 
-                if text and finish_reason in {"MAX_TOKENS", "LENGTH"}:
-                    continuation_prompt = _build_gemini_continuation_prompt(text)
+                cont_attempts = 0
+                MAX_CONTINUATIONS = 3
+                while text and finish_reason in {"MAX_TOKENS", "LENGTH"} and cont_attempts < MAX_CONTINUATIONS:
+                    cont_attempts += 1
+                    logger.info(f"Gemini: completando texto cortado por limite (intento {cont_attempts}/{MAX_CONTINUATIONS})...")
                     continuation_payload = {
                         "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-                        "contents": [{"parts": [{"text": continuation_prompt}]}],
+                        "contents": [
+                            {"role": "user", "parts": [{"text": prompt}]},
+                            {"role": "model", "parts": [{"text": text[-15000:]}]}, # Solo enviar los ultimos 15000 chars si es muy largo
+                            {"role": "user", "parts": [{"text": "Continua exactamente desde donde terminaste en la respuesta anterior, manteniendo el formato HTML sin reiniciar secciones ni repetir texto."}]}
+                        ],
                         "generationConfig": {
                             "temperature": AI_TEMPERATURE,
                             "maxOutputTokens": GEMINI_MAX_OUTPUT_TOKENS,
@@ -469,12 +476,20 @@ async def _call_gemini(
                         cont_data = cont_resp.json()
                         cont_candidates = cont_data.get("candidates", [])
                         if cont_candidates:
-                            cont_parts = cont_candidates[0].get("content", {}).get("parts", [])
+                            selected_cont = cont_candidates[0]
+                            cont_parts = selected_cont.get("content", {}).get("parts", [])
                             cont_text = "\n".join(
                                 part.get("text", "") for part in cont_parts if part.get("text")
                             ).strip()
+                            finish_reason = (selected_cont.get("finishReason") or "").upper()
                             if cont_text:
                                 text = f"{text}\n{cont_text}".strip()
+                            else:
+                                break
+                        else:
+                            break
+                    else:
+                        break
 
                 if text:
                     return text
@@ -793,23 +808,55 @@ async def summarize(transcript: str, materia: str, progress_callback=None) -> st
     logger.info(f"Generando resumen | {len(transcript):,} chars | proveedor={primary.value} | modelo={actual_model}")
 
     if progress_callback:
-        await progress_callback(20, "Generando resumen...")
+        await progress_callback(20, "Analizando transcripción...")
 
-    if len(transcript) > max_single:
-        summary_html = await _summarize_chunks(transcript, materia, progress_callback=progress_callback)
-    else:
-        # Use single pass with override_model if gemini
-        if override_model:
-            logger.info(f"Ruta single - Usando modelo mas capaz y limitante para textos cortos: {override_model}")
-            if gemini_secondary_model:
-                logger.info(
-                    "Ruta single larga - Si falla 2.5 tras reintentos, "
-                    f"probando fallback Gemini: {gemini_secondary_model}"
-                )
-        prompt = _build_summary_prompt(transcript, materia=materia)
-        summary_html = clean_html(await _call_ai(prompt, override_model, gemini_secondary_model))
+    async def _do_main_summary():
+        if len(transcript) > max_single:
+            return await _summarize_chunks(transcript, materia, progress_callback=progress_callback)
+        else:
+            if override_model:
+                logger.info(f"Ruta single - Usando modelo mas capaz y limitante para textos cortos: {override_model}")
+                if gemini_secondary_model:
+                    logger.info(
+                        "Ruta single larga - Si falla 2.5 tras reintentos, "
+                        f"probando fallback Gemini: {gemini_secondary_model}"
+                    )
+            prompt = _build_summary_prompt(transcript, materia=materia)
+            return clean_html(await _call_ai(prompt, override_model, gemini_secondary_model))
 
-# Verificacion basica (solo si devuelven vacio completo, que es falla catastrofica)
+    async def _do_task_extraction():
+        if primary != AIProvider.GEMINI:
+            return ""
+        prompt = f"{TASK_EXTRACTION_PROMPT}\n\nTRANSCRIPCION:\n{transcript}"
+        try:
+            logger.info(f"Ruta tareas - Extrayendo tareas con modelo especializado: {GEMINI_TASKS_MODEL}")
+            result = await _call_ai(prompt, override_model=GEMINI_TASKS_MODEL)
+            
+            # Limpieza estricta: buscar la etiqueta <h2> para ignorar texto conversacional previo
+            result_clean = result.strip()
+            for marker in ("```html", "```"):
+                result_clean = result_clean.replace(marker, "")
+            
+            h2_index = result_clean.find("<h2")
+            if h2_index != -1:
+                result_clean = result_clean[h2_index:]
+            
+            # Asegurar que siempre devuelva HTML válido y no caiga en el fallback de clean_html
+            if not result_clean.startswith("<"):
+                result_clean = f"<h2>📝 Carga Academica y Fechas Importantes</h2>\n<p>{result_clean}</p>"
+                
+            return result_clean.strip()
+        except Exception as exc:
+            logger.warning(f"Error en extraccion de tareas: {exc}")
+            return "<h2>📝 Carga Academica y Fechas Importantes</h2>\n<p><strong>No fue posible analizar la transcripción en busca de tareas debido a un error técnico.</strong></p>"
+
+    # Lanzamos ambos en paralelo
+    summary_task = asyncio.create_task(_do_main_summary())
+    tasks_task = asyncio.create_task(_do_task_extraction())
+
+    summary_html, tasks_html = await asyncio.gather(summary_task, tasks_task)
+
+    # Verificacion basica (solo si devuelven vacio completo, que es falla catastrofica)
     if not summary_html or not summary_html.strip() or len(summary_html) < 50:
         logger.warning("Resumen IA devolvio salida vacia. Se usa fallback")
         fallback_html = _fallback_summary(transcript)
@@ -821,14 +868,18 @@ async def summarize(transcript: str, materia: str, progress_callback=None) -> st
         )
         return fallback_html
 
+    final_html = summary_html
+    if tasks_html:
+        final_html += f"\n\n{tasks_html}"
+
     logger.info(
         "Resumen metrics | status=ok | "
         f"provider={primary.value} | route={route} | "
-        f"in_chars={len(transcript)} | out_chars={len(summary_html)} | out_words={_word_count(summary_html)} | "
+        f"in_chars={len(transcript)} | out_chars={len(final_html)} | out_words={_word_count(final_html)} | "
         f"duration_ms={(time.perf_counter() - started_at) * 1000:.0f}"
     )
 
-    return summary_html
+    return final_html
 
 
 def clean_html(raw: str) -> str:

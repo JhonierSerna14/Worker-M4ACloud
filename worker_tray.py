@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import os
 import signal
+import sys
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -39,6 +41,7 @@ class WorkerTrayApp:
             menu=Menu(
                 MenuItem("Abrir log", self._open_log),
                 MenuItem("Abrir carpeta", self._open_project_folder),
+                MenuItem("Reiniciar", self._restart),
                 MenuItem("Salir", self._quit),
             ),
         )
@@ -116,6 +119,10 @@ class WorkerTrayApp:
         os.startfile(str(PROJECT_ROOT))
 
     def _quit(self, icon, item):
+        self.request_shutdown()
+
+    def _restart(self, icon, item):
+        subprocess.Popen([sys.executable] + sys.argv)
         self.request_shutdown()
 
     def request_shutdown(self):
